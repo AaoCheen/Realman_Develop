@@ -1,0 +1,205 @@
+import unittest
+
+from gripper_ros2 import gripper_driver as gd
+
+
+class FakeInstrument:
+    def __init__(self, address):
+        self.address = address
+
+
+class FakeSDK:
+    fail_ports = set()
+
+    def __init__(self, port, slave_id=1, baudrate=115200, timeout=0.3):
+        if port in self.fail_ports:
+            raise OSError(f"could not open {port}")
+        self.port = port
+        self.instrument = FakeInstrument(slave_id)
+        self.calls = []
+
+    def connect(self):
+        self.calls.append(("connect",))
+        return True
+
+    def disconnect(self):
+        self.calls.append(("disconnect",))
+
+    def enable(self, value=True):
+        self.calls.append(("enable", value))
+
+    def temp_move(self, position_mm, speed_pct, force_pct, accel, decel, trigger=True):
+        self.calls.append(("temp_move", position_mm, speed_pct, force_pct))
+
+    def set_temp_position_mm(self, position):
+        self.calls.append(("set_pos", position))
+
+    def trigger_temp_move(self):
+        self.calls.append(("trigger",))
+
+    def _r(self, address, count=1):
+        if address == gd.REG_SPEED_FB:
+            return [100, 20, 0, 4500][:count]
+        if address == gd.REG_TORQUE_REACHED:
+            return [1, 0, 0, 1][:count]
+        if address == gd.REG_ALARM:
+            return [2][:count]
+        return [0] * count
+
+
+class DriverTest(unittest.TestCase):
+    def setUp(self):
+        self.original = gd.Changingtek_rtu_psdk
+        gd.Changingtek_rtu_psdk = FakeSDK
+
+    def tearDown(self):
+        gd.Changingtek_rtu_psdk = self.original
+        FakeSDK.fail_ports = set()
+
+    def manager(self):
+        manager = gd.GripperManager()
+        manager.add_bus("/bus")
+        manager.add_gripper("/bus", 4, name="left", max_position=9000)
+        manager.add_gripper("/bus", 5, name="right", max_position=8000)
+        manager.connect_all()
+        return manager
+
+    def test_one_sdk_is_shared_and_address_switches(self):
+        manager = self.manager()
+        left, right = manager.get("left"), manager.get("right")
+        left.read_feedback()
+        self.assertEqual(left.bus._sdk.instrument.address, 4)
+        right.read_feedback()
+        self.assertEqual(right.bus._sdk.instrument.address, 5)
+        self.assertIs(left.bus._sdk, right.bus._sdk)
+
+    def test_feedback_is_batch_parsed(self):
+        device = self.manager().get("left")
+        feedback = device.read_feedback()
+        self.assertEqual(feedback["position"], 4500)
+        self.assertEqual(feedback["position_mm"], 45.0)
+        self.assertTrue(feedback["torque_reached"])
+        self.assertEqual(feedback["alarm"], 2)
+
+    def test_unchanged_parameters_use_short_write(self):
+        device = self.manager().get("left")
+        device.move_to(1000)
+        device.bus._sdk.calls.clear()
+        device.move_to(2000)
+        kinds = [call[0] for call in device.bus._sdk.calls]
+        self.assertEqual(kinds, ["set_pos", "trigger"])
+
+    def test_streaming_targets_take_bus_priority_over_feedback(self):
+        bus = self.manager().get_bus("/bus")
+        reads = []
+        original = bus.devices[4].read_feedback
+        bus.devices[4].read_feedback = lambda: reads.append(1) or original()
+        bus._last_poll = 100.0
+        for step in range(10):  # 10 targets at 50 Hz => 0.2 s of streaming
+            bus.request_move(4, 1000 + step)
+            bus._cycle(100.0 + step * 0.02)
+        self.assertEqual(reads, [])
+        bus._cycle(100.6)  # streaming stopped; one feedback refresh resumes
+        self.assertEqual(len(reads), 1)
+
+    def test_idle_bus_polls_every_cycle(self):
+        bus = self.manager().get_bus("/bus")
+        reads = []
+        original = bus.devices[4].read_feedback
+        bus.devices[4].read_feedback = lambda: reads.append(1) or original()
+        bus._cycle(50.0)
+        bus._cycle(50.05)
+        self.assertEqual(len(reads), 2)
+
+    def _stream_bus(self):
+        manager = gd.GripperManager()
+        manager.add_bus("/bus", min_command_interval_s=0.25, command_deadband=0.01)
+        manager.add_gripper("/bus", 1, name="g", open_position=4000,
+                            close_position=12000, max_position=12000)
+        manager.connect_all()
+        return manager.get_bus("/bus")
+
+    def test_trigger_rate_is_limited_and_newest_target_wins(self):
+        bus = self._stream_bus()
+        for step in range(10):  # 20 Hz stream for 0.5 s
+            bus.request_move(1, 5000 + step * 500)
+            bus._process_pending(100.0 + step * 0.05)
+        triggers = [c for c in bus._sdk.calls if c[0] in ("temp_move", "trigger")]
+        self.assertLessEqual(len(triggers), 3)
+        self.assertGreaterEqual(len(triggers), 2)
+        bus._process_pending(101.0)  # held target is flushed once it is due
+        self.assertEqual(bus._last_sent[1][1], 5000 + 9 * 500)
+
+    def test_targets_inside_deadband_are_dropped_but_endpoints_are_sent(self):
+        bus = self._stream_bus()
+        bus.request_move(1, 8000)
+        bus._process_pending(100.0)
+        bus._sdk.calls.clear()
+        bus.request_move(1, 8040)  # 0.5% of the 8000-unit span
+        bus._process_pending(101.0)
+        self.assertEqual(bus._sdk.calls, [])
+        self.assertEqual(bus._pending, {})
+        bus.request_move(1, 12000)  # exact close endpoint is never skipped
+        bus._process_pending(102.0)
+        self.assertEqual(bus._last_sent[1][1], 12000)
+
+    def test_identical_target_is_not_retriggered_even_at_endpoints(self):
+        bus = self._stream_bus()
+        bus.request_move(1, 12000)
+        bus._process_pending(100.0)
+        bus._sdk.calls.clear()
+        bus.request_move(1, 12000)
+        bus._process_pending(101.0)
+        self.assertEqual(bus._sdk.calls, [])
+
+    def test_next_due_reports_wait_for_held_target(self):
+        bus = self._stream_bus()
+        bus.request_move(1, 5000)
+        bus._process_pending(100.0)
+        bus.request_move(1, 9000)
+        bus._process_pending(100.05)
+        self.assertAlmostEqual(bus._next_due(100.05), 0.20, places=3)
+
+    def test_is_streaming_covers_pending_and_recent_sends(self):
+        bus = self._stream_bus()
+        self.assertFalse(bus.is_streaming(1, now=100.0))
+        bus.request_move(1, 5000, now=100.0)
+        self.assertTrue(bus.is_streaming(1, now=100.0))
+        bus._process_pending(100.0)
+        self.assertTrue(bus.is_streaming(1, now=101.9))
+        self.assertFalse(bus.is_streaming(1, now=102.1))
+
+    def test_is_streaming_survives_deduped_targets_that_are_never_sent(self):
+        bus = self._stream_bus()
+        for step in range(40):  # held-still 20 Hz stream from 100.0 to 101.95
+            now = 100.0 + step * 0.05
+            bus.request_move(1, 5000, now=now)
+            bus._process_pending(now)
+        self.assertEqual(bus._last_sent[1][0], 100.0)  # only the first target hit the bus
+        self.assertTrue(bus.is_streaming(1, now=102.0))
+        self.assertFalse(bus.is_streaming(1, now=104.0))
+
+    def test_apply_endpoints_updates_device_and_clears_stream_state(self):
+        bus = self._stream_bus()
+        bus.request_move(1, 5000)
+        bus._process_pending(100.0)
+        bus.request_move(1, 9000)
+        bus.apply_endpoints(1, 50, 8500)
+        device = bus.get(1)
+        self.assertEqual((device.open_position, device.close_position), (50, 8500))
+        self.assertEqual(bus._pending, {})
+        self.assertNotIn(1, bus._last_sent)
+        self.assertNotIn(1, bus._last_request)
+
+    def test_missing_port_can_reconnect(self):
+        FakeSDK.fail_ports = {"/bad"}
+        manager = gd.GripperManager()
+        manager.add_bus("/bad")
+        manager.add_gripper("/bad", 1, name="g")
+        self.assertFalse(manager.connect_all()["/bad"])
+        FakeSDK.fail_ports.clear()
+        self.assertTrue(manager.get_bus("/bad").connect())
+
+
+if __name__ == "__main__":
+    unittest.main()

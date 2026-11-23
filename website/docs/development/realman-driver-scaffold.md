@@ -1,0 +1,519 @@
+---
+title: 睿尔曼三臂驱动与运动控制
+description: RealMan Python SDK 的 ROS 2 Humble 三臂回读、运动 Action、坐标系和末端速度控制契约。
+---
+
+# 睿尔曼三臂驱动与运动控制
+
+`realman_robot_driver` 是 `src/driver/` 下的 ROS 2 Humble Python 包。驱动通过睿尔曼 Python SDK 发布关节状态，并提供普通运动 Action 与六轴笛卡尔速度 session。离线测试使用独立的 mock 配置文件，不连接控制器。
+
+需要扩展 Action、理解 reservation/generation/lockout 状态机或查找逐项测试用例时，先看
+[睿尔曼 Action 开发与测试](./realman-action-development)；本页保留运行时 ROS 图、配置和真机放行清单。
+
+运动接口已在生产三臂上运行，但 mock 测试结果不能替代现场安全验证。新的控制器、固件、网络或 SDK 版本，以及任何改变运动路径的修改，都必须重新经过本页末尾的运行门槛。
+
+<Glance :items="[{ label: '命名空间', value: '/l  /m  /r' }, { label: '运动 owner', value: '每臂唯一' }, { label: '失效保护', value: 'watchdog 100 ms' }, { label: 'SDK', value: 'Robotic_Arm 1.1.6' }]" />
+
+拖动关节滑块，看六个关节的真实限位（取自 URDF）和连杆坐标系。
+
+<UrdfFigure model="arm" controls frames focus="link_6" caption="RM65-B：joint_1…joint_6，高亮的是末端 link_6 的坐标系" />
+
+## 模块边界
+
+```text
+config/ros/realman_driver.yaml
+config/ros/realman_coordinates.yaml
+config/ros/realman_motion.yaml
+                │
+                ▼
+     /l|m|r/realman_driver
+        │             │
+        │             ├── /l|m|r/joint_states
+        ▼
+RealManSdkAdapter
+        │
+        ├── mock_mode=true: 内存状态，不导入厂商 SDK
+        └── mock_mode=false: Robotic_Arm.rm_robot_interface
+                                  │
+                                  ▼
+                         robot_state_publisher -> TF -> RViz 2
+```
+
+| 路径 | 职责 |
+| --- | --- |
+| `realman_robot_driver/realman_driver_node.py` | 参数、ROS topic/service、日志、单位转换和节点清理 |
+| `realman_robot_driver/realman_sdk_adapter.py` | SDK 导入、句柄、连接、状态、运动、停止、坐标和释放 |
+| `realman_robot_driver/motion_coordinator.py` | 普通运动 Action 的 ownership、反馈、取消、完成确认和安全锁定 |
+| `realman_robot_driver/cartesian_velocity_session.py` | 六轴速度 session、限速/限加速度、命令时序和 watchdog |
+| `realman_robot_driver/coordinate_manager.py` | 工具/工作坐标期望状态、回读验证和 motion gate |
+| `realman_msgs/action`、`realman_msgs/srv` | ROS 2 Action 与坐标 Service 的公开 IDL |
+| `launch/realman_driver.launch.py` | 启动一台 namespaced 驱动 |
+| `launch/three_realman_drivers.launch.py` | 启动 `l`、`m`、`r` 三台驱动 |
+| `config/ros/realman_driver.yaml` | 三台实例的权威连接与运行参数 |
+| `config/ros/realman_driver_mock.yaml` | 不连接真机的自动化测试参数 |
+| `config/ros/realman_coordinates.yaml` | 三臂工具/工作坐标、四元数、负载和启动策略 |
+| `config/ros/realman_motion.yaml` | 普通运动与末端速度的逐臂安全上限 |
+| `config/python/realman-sdk-requirements.txt` | Docker 使用的 SDK 版本锁定 |
+
+SDK 适配器保留厂商返回码。SDK 未安装且关闭 mock 时，连接返回驱动内部状态 `-100`；该值不是睿尔曼 API2 官方错误码，用于明确区分本地依赖缺失。
+
+## ROS 图
+
+三臂 launch 创建：
+
+```text
+/l/realman_driver
+├── /l/joint_states       sensor_msgs/msg/JointState
+├── /l/joint_currents     sensor_msgs/msg/JointState（effort = 关节电流，mA）
+├── /l/connected          std_msgs/msg/Bool
+├── /l/coordinates/state  std_msgs/msg/String（JSON，transient-local）
+├── /l/execute_motion     realman_msgs/action/ExecuteMotion
+├── /l/execute_trajectory realman_msgs/action/ExecuteTrajectory
+├── /l/cartesian_velocity realman_msgs/action/CartesianVelocity
+├── /l/cartesian_velocity/command geometry_msgs/msg/TwistStamped
+├── /l/cartesian_velocity/state   realman_msgs/msg/CartesianVelocityState
+├── /l/cartesian_pose     realman_msgs/action/CartesianPose
+├── /l/cartesian_pose/command     geometry_msgs/msg/PoseStamped
+├── /l/connect            std_srvs/srv/Trigger
+├── /l/disconnect         std_srvs/srv/Trigger
+├── /l/stop               std_srvs/srv/Trigger
+├── /l/recover_motion     realman_msgs/srv/RecoverMotion
+├── /l/status             std_srvs/srv/Trigger
+├── /l/controller_info    std_srvs/srv/Trigger（只读诊断，见下）
+├── /l/get_current_pose   realman_msgs/srv/GetCurrentPose
+├── /l/forward_kinematics realman_msgs/srv/ForwardKinematics
+├── /l/solve_ik           realman_msgs/srv/SolveIk
+├── /l/coordinates/verify       realman_msgs/srv/VerifyCoordinates
+├── /l/coordinates/apply        realman_msgs/srv/VerifyCoordinates
+├── /l/coordinates/select_tool  realman_msgs/srv/SelectFrame
+└── /l/coordinates/select_work  realman_msgs/srv/SelectFrame
+
+/m/realman_driver         # 相同的 namespaced 接口
+/r/realman_driver         # 相同的 namespaced 接口
+```
+
+`joint_states.position` 遵守 ROS 约定使用弧度。适配器从 `rm_get_joint_degree()` 读取厂商的度数，节点只在发布边界转换一次。RM65-B 的六个名称固定为 `joint_1` 到 `joint_6`，由配置中的 `joint_names` 显式声明。
+
+每发布一次 `joint_states`，节点还会用 `rm_get_current_joint_current()` 读一次关节电流，发布到 `joint_currents`：电流（mA）放在 `JointState.effort`，`position` 为空，时间戳与对应的 `joint_states` 相同。读取失败时只是这一拍不发布，不会把机械臂标记为断连，也不会覆盖已记录的错误。PolicyRun 把它记录进每次尝试的轨迹，并据此判定手臂是否顶在桌面上（见[关节电流保护](./policy-task#关节电流保护)）。这一读与速度指令共用 SDK 锁，如果速度会话的 `late` 计数明显上升，可以设置 `publish_joint_currents: false` 关闭，但关闭后电流保护也随之失效。
+
+未连接或 SDK 状态查询失败时不发布不可用的关节状态；mock 连接后发布六轴零位。通信错误
+`-1/-2` 或 SDK 异常会将当前连接标记为失效，节点记录错误、发布该臂离线状态并按
+`reconnect_interval` 自动重连；异常不会从启动连接流程或状态定时器向 ROS executor 冒泡，
+因此单臂控制器失败不会退出整个驱动节点。`connected` 表示连接生命周期，调用方还应检查
+`/status` 返回的 `last_error`。
+
+```mermaid
+flowchart TD
+  C0["首次连接失败（臂后上电）<br/>或通信错误 -1/-2 / SDK 异常<br/>connected=false"] --> T["每 reconnect_interval（5 s）重试"]
+  T --> S["同一个 RoboticArm 对象上<br/>删除旧句柄 → 重建句柄<br/>不调用 rm_destroy"]
+  S -- "无效句柄 id=-1 / socket 错误" --> T
+  S -- 成功 --> R{"断线前已连接过？"}
+  R -- 否（首次连接） --> V["重新回读并校验坐标"]
+  R -- 是 --> STOP["新句柄上 stop()"]
+  STOP -- "0" --> CLR["释放旧会话 lockout 与 ownership"] --> V
+  STOP -- "非 0" --> DROP["保留 lockout<br/>释放句柄"] --> T
+  V -- 匹配/修复成功 --> OK["开放 motion gate"]
+  V -- 读写失败或回读不符 --> BLK["motion gate 关闭<br/>仅 MOVEJ 可用"]
+  V -- "坐标启动被拒（如 arm busy）" --> DROP2["释放句柄"] --> T
+```
+
+#### 进程内重连：不调用 `rm_destroy()`
+
+每个臂的驱动是独立进程，`RealManSdkAdapter` 在第一次连接时创建一个 `RoboticArm(mode)`（SDK 在此执行进程级
+`rm_init()`），之后整个进程生命周期都保留这个对象。首次连接失败、断线、`/disconnect` 服务、回调注册失败、
+状态读取异常以及事件通道恢复，都只做两件事：用 `rm_delete_robot_arm()` 释放本臂的旧句柄（仅当旧句柄 id 有效；
+`id=-1` 的无效句柄从未在 SDK 中登记，直接丢弃），再在同一对象上调用 `rm_create_robot_arm()`。失败时对象保留，
+下一次重试继续在同一个 SDK 状态上重建，臂恢复应答后的第一次重试就会连上，不需要重启容器。
+
+`rm_destroy()` 是类方法，会关闭本进程的全部连接并销毁 SDK 线程；之后即使重新 `RoboticArm(mode)`，
+`rm_create_robot_arm()` 也会一直返回 `id=-1`（日志表现为每 5 s 一次
+`RealMan connection failed with API2 status -1: SDK returned an invalid robot handle`），只能重启进程。
+2026-11-13 m/r 臂在晚上电和示教器清除 4116 错误后都卡在这一状态，就是旧实现在首次失败和连续三次原地失败后
+调用了它。现在只有 `adapter.shutdown()` 调用 `rm_destroy()`，且只在 `destroy_node()` 退出进程时执行。
+重连只涉及本臂自己的句柄，不影响其他臂和夹爪。测试见
+`src/driver/realman_robot_driver/test/test_sdk_reconnect.py`：伪 SDK 先返回 N 次无效句柄再返回有效句柄，
+验证驱动在同一进程内恢复。
+
+#### 断线时正在运行的会话：重连后释放 lockout
+
+速度/位姿会话运行中断线（例如一次 `-2` 关节读取超时）时，零速和 `slow_stop` 只能发到已失效的句柄上，
+返回非零状态，会话因此进入 lockout 并保留该臂 ownership。旧实现中只有显式 `/disconnect` 才会清除它；
+自动重连成功后坐标启动需要 ownership，于是报
+`RealMan coordinate startup failed ... arm l is busy; coordinate operation refused`，之后所有运动目标都被
+`Rejecting motion goal: arm l is busy` 拒绝，`select_work` 报 `coordinate mutation refused`，只能重启容器
+（2026-11-13 SJDrealman，Pika 速度遥操作中 l/r 两臂同时出现）。
+
+现在自动重连（非首次连接、非事件通道恢复）在注册回调后、对账之前先在新句柄上调用 `stop()`：
+返回 `0` 才按 `/disconnect` 的同样规则释放速度会话、位姿会话和 motion coordinator 的 lockout 与 ownership，
+然后对账并重新校验坐标；`stop()` 失败则保留 lockout、释放句柄，按 `reconnect_interval` 重试。坐标启动失败
+（包括仍然 busy）同样释放句柄，避免 `connected=true` 让重连定时器永远不再尝试。日志中出现
+`RealMan link was lost; stopped on the new connection and released session lockouts` 即表示走了这条路径。
+测试见 `test_realman_driver_node.py` 中的 `test_reconnect_after_lost_link_*` 等用例。
+
+### 控制器诊断：`controller_info`
+
+`/<arm>/controller_info`（`std_srvs/srv/Trigger`）把控制器的只读 getter 结果打包为 JSON 放在 `message` 中：软件/机器人信息、安装位姿、DH 参数、关节与笛卡尔限位、运行模式、当前工具/工作坐标和关节状态标志。它复用该臂已有的 SDK 连接，不会再开第二个连接，因此可以安全地并排比较两台控制器的配置差异（例如排查"同样的 Pika 动作左臂正常、右臂异常"）。允许名单只含纯读取接口；某个 getter 失败只会在结果里标记该项失败，不影响其它项。mock 模式返回空结果。
+
+```bash
+ros2 service call /l/controller_info std_srvs/srv/Trigger "{}"
+ros2 service call /r/controller_info std_srvs/srv/Trigger "{}"
+```
+
+### 自定义 IK 与位姿接口
+
+`cartesian_pose` Action 与 `get_current_pose`、`forward_kinematics`、`solve_ik` 服务属于位姿控制面，契约见[睿尔曼 Action 开发与测试](./realman-action-development)。位姿 session 默认使用 CasADi + IPOPT 的自定义 IK（依赖 `config/python/ik-requirements.txt`，以上次关节指令热启动以避免 IK 分支跳变，工具偏移取 `realman_coordinates.yaml` 的 `tcpgrip`，每个 session 先与 SDK 正解比对 TCP，细节见[位姿 session 的逆解](./realman-action-development#位姿-session-的逆解)）；`pinocchio.casadi` 绑定缺失或 URDF 加载失败时，驱动记录一条 WARN 并回退到 SDK 自带 IK，位姿 session 仍可使用。PyPI 上的 `pinocchio` 是无关的包，`config/python/ik-requirements.txt` 因此只安装 `casadi`；当前生产镜像没有 `pinocchio.casadi`，所以实际运行在 SDK IK 回退路径上，`Custom CasADi IK unavailable` 的 WARN 是已知状态，而不是启动失败。
+
+历史说明：`ik_solver.py` 最初提交时漏掉了字符串字面量的引号（`end_joint: str = joint_6`、`solver(ipopt, …)` 等），即使依赖齐全，一导入也会 `NameError` 并静默回退，所以自定义 IK 实际从未生效过；现已修复，并由 `test_ik_solver.py`（用桩替换 CasADi / Pinocchio）保证模块能导入、构造和求解。补上引号后还暴露出几处会让它下发错误关节的问题，已一并修复：接口单位改为关节 degree（原先把 degree 种子当 radian 用、并把 radian 解当 degree 下发）、`pin.Quaternion` 的 w 在前、工具偏移从坐标配置读取、姿态误差改为在零误差处光滑的形式、解离目标超过 `2 mm`/`1°` 或任一关节跳变超过 `30°` 时保持不动。装有 `casadi` 和 `pinocchio.casadi` 时，`test_ik_solver.py` 还会验证 FK(IK(pose)) 往返。真机上的表现（求解耗时、`Custom IK TCP matches SDK FK` 日志）仍需提供带 `pinocchio.casadi` 的镜像后在现场按运行门槛验证。
+
+`stop` 当前映射到官方 `rm_set_arm_stop()`，表示最快关节速度受控停止且轨迹不可恢复。它不是断电急停，也不替代现场安全回路。
+
+## 普通运动 Action
+
+每臂的 `execute_motion` Action 提供同一套可取消接口：
+
+| `command` | 官方调用 | 目标字段与单位 |
+| --- | --- | --- |
+| `MOVEJ=0` | `rm_movej()` | `joint_degrees[6]`，度 |
+| `MOVEL=1` | `rm_movel()` | `pose_position_m[3]`（m）和 `pose_quaternion_wxyz[4]` |
+| `MOVEJ_P=2` | `rm_movej_p()` | `pose_position_m[3]`（m）和 `pose_quaternion_wxyz[4]` |
+
+四元数顺序固定为 `w, x, y, z`，入口会检查有限值、非零模并归一化。ROS 接口和内部状态不使用 Euler 角；只有 SDK 确实只接受 Euler 的坐标写入边界才会进行一次转换。`velocity_percent` 范围为 `1..100`，`blend_radius_percent` 为 `0..100`，第一版只接受 `connect=false`，`timeout_sec` 必须为正有限数。
+
+多点连续运动使用独立的 `execute_trajectory` Action，而不是放开
+`ExecuteMotion.connect=true`。它一次接收 2--256 个 `MotionWaypoint`，整条队列持续
+占有单臂 ownership；非末点由驱动设为 `connect=1`，末点设为 `connect=0`。取消会立即
+停止整条队列，不能把取消后的新 goal 当作连续轨迹。详细字段和 CLI 示例见
+[睿尔曼 Action 开发与测试](./realman-action-development#executetrajectory-契约)。
+
+一个目标只有同时收到当前 generation 的成功事件、观察到轨迹曾为 active 后回到 inactive、连接仍有效时才成功；MOVEJ 还要求六个关节都落入 `joint_goal_tolerance_deg`。如果 MOVEJ 提交前回读关节已经在目标容差内，驱动直接返回 `motion already at target`，不再等待控制器产生一条空轨迹。反馈阶段依次为 `VALIDATING`、`SUBMITTING`、`EXECUTING`，停止时进入 `STOPPING`，并持续返回当前关节角、活动坐标、API2 状态和详情。Action cancel 使用 `rm_set_arm_stop()` 并等待 inactive；如果已提交目标没有可关联的完成事件，驱动会在确认 inactive 后自动重建该臂 SDK 事件通道，再允许下一条目标；`/l|m|r/stop` 抢占 ownership 并使用 `rm_set_arm_stop()`。
+
+以下命令可在 mock 服务运行时验证完整 Action，不会连接真机：
+
+```bash
+ros2 action send_goal /l/execute_motion realman_msgs/action/ExecuteMotion \
+  "{command: 0, reference_type: 0, reference_name: base, \
+    joint_degrees: [0, 0, 0, 0, 0, 0], \
+    pose_position_m: [0, 0, 0], \
+    pose_quaternion_wxyz: [1, 0, 0, 0], \
+    velocity_percent: 10, blend_radius_percent: 0, \
+    connect: false, timeout_sec: 2.0}" --feedback
+```
+
+`reference_type` 为 `BASE=0`、`WORK=1` 或 `TOOL=2`；`reference_name` 使用控制器名称，例如 `base`、`cell` 或 `tcpgrip`。WORK/TOOL 必须与当前已回读验证的控制器选择一致。
+
+## 坐标系与 motion gate
+
+`config/ros/realman_coordinates.yaml` 是工具和工作坐标的权威期望状态。每个工具包含控制器名、namespaced ROS frame、位置（m）、`quaternion_wxyz`、负载（kg）和质心（m）；工作坐标包含控制器名、ROS frame、位置和四元数。默认三臂工具为 `tcpgrip`，工作坐标为 `cell`。
+
+RealMan RM65 控制器的 `rm_get_current_tool_frame()` 回读中，`rm_frame_t.x/y/z` 质心字段使用毫米；驱动适配器在 SDK 边界将其转换为米后再交给坐标管理器。工具配置、`rm_set_manual_tool_frame()`/`rm_update_tool_frame()` 写入以及项目内部接口统一使用米。不要为了适配该回读值把 `config/ros/realman_coordinates.yaml` 中的质心改成毫米。
+
+每次连接都会先读取控制器当前工具/工作坐标并逐字段比较。读取成功但任一字段不匹配时，驱动自动将 `config/ros/realman_coordinates.yaml` 中的默认工具/工作坐标写入控制器、选择对应名称并回读确认；`policy.on_start` 保留用于兼容旧配置，不再允许跳过失配修复。API2 读取或写入失败、或写后回读仍不匹配，都会关闭该臂 motion gate；该 gate 拦截依赖控制器工具/工作坐标的 `MOVEL`、`MOVEJ_P` 和速度 session。关节空间 `MOVEJ` 只使用六轴关节角，不依赖当前工具/工作坐标，因此仍可用于低速回零、离开安全位置或后续重新校准。四个 Service 与普通运动共享单臂 ownership：
+
+事件通道恢复和自动重连也会重复执行同一套坐标 verify/reconcile 流程；恢复期间由恢复流程持有的单臂 ownership 会传递给坐标操作，避免释放后竞态。任何恢复后的坐标读取或写入失败都会继续保持 motion gate 关闭。
+
+| Service | 行为 |
+| --- | --- |
+| `coordinates/verify` | 只读回查；完整匹配后开放 motion gate |
+| `coordinates/apply` | 显式写入默认工具/工作坐标、选择并回读 |
+| `coordinates/select_tool` | 选择配置内工具并回读完整坐标状态 |
+| `coordinates/select_work` | 选择配置内工作坐标并回读完整坐标状态 |
+
+```bash
+ros2 service call /l/coordinates/verify realman_msgs/srv/VerifyCoordinates "{}"
+ros2 service call /l/coordinates/select_tool realman_msgs/srv/SelectFrame \
+  "{name: tcpgrip}"
+ros2 service call /l/coordinates/select_work realman_msgs/srv/SelectFrame \
+  "{name: cell}"
+```
+
+`coordinates/apply` 会修改真实控制器；只能在机械臂空闲、标定值已复核且现场安全条件满足时显式调用。所有 mutation 在写入后回读，返回 `api2_status`，失败时保持 motion gate 关闭。
+当同名工具或工作坐标已经存在时，适配器会在新建接口返回 API2 状态 `1` 后改用
+`rm_update_tool_frame()` 或 `rm_update_work_frame()` 覆盖该配置，再选择并回读；因此重复
+执行 `coordinates/apply` 不需要人工先删除控制器中的同名坐标。
+
+## 笛卡尔速度 session
+```mermaid
+sequenceDiagram
+  participant C as 客户端
+  participant D as 驱动 session
+  participant S as SDK
+  C->>D: CartesianVelocity Goal（WORK/TOOL，control_period_ms）
+  D->>D: 校验周期/限值，取得 ownership，确认坐标 gate
+  D-->>C: 接受
+  D->>S: rm_set_movev_canfd_init
+  loop 每个控制周期
+    C->>D: command（非零且严格递增的 stamp）
+    D->>S: 限速、限加速度后的速度
+  end
+  alt 超过 watchdog 无命令
+    D->>S: 受控停止
+    D-->>C: WATCHDOG_STOP
+  else 客户端取消
+    D->>S: 受控停止
+    D-->>C: CANCELED
+  end
+```
+
+
+`cartesian_velocity` Action 持有单臂运动 ownership，`cartesian_velocity/command` 只更新该 session 的最新六轴目标。`TwistStamped.twist` 的前三项是线速度 `vx/vy/vz`（m/s），后三项是角速度 `wx/wy/wz`（rad/s）；实现不使用 Euler 角。
+
+RealMan 速度初始化没有独立 BASE 选项，因此 `reference_type=BASE` 的速度 Goal 会在初始化前被拒绝。WORK 和 TOOL session 的 `header.frame_id` 必须是当前已验证且激活的 ROS frame（默认 WORK 为 `l/work/cell`，Pika 使用 identity WORK `l/work/pikabase`）。目标还受 `config/ros/realman_motion.yaml` 的线速度、角速度和加速度限制。
+
+命令订阅使用 `KEEP_LAST` depth 1、`VOLATILE`，**不设置 DDS lifespan**：lifespan 依赖墙钟，跨主机时钟漂移会静默丢弃有效命令，新鲜度改由 session 的单调 watchdog 和相对时间戳检查保证。订阅拥有独立的 `MutuallyExclusiveCallbackGroup`，不与 Reentrant 的运动 Action callback group 共用。每条命令必须提供非零 `header.stamp`，并满足以下条件：
+
+- 时间戳不得早于当前 Action session 的启动 epoch；
+- 时间戳不得晚于节点 ROS clock，也不得比 Action watchdog 更旧；
+- 同一 session 中必须严格晚于上一条已接受命令。
+
+上述比较使用节点 ROS clock，因此 `use_sim_time` 测试可以控制时间来源。零时间戳、旧 session backlog、乱序或过期命令都在进入 SDK 控制循环前被拒绝，拒绝日志使用 DEBUG，避免高率无效输入刷 WARN。
+
+控制线程按 `control_period_ms` 调用 SDK；SDK 调用超过 deadline 时跳过过期 tick，并从调用完成时间重排下一周期，不补发 0 ms 间隔的追赶命令。watchdog 由独立监督线程执行，命令时间戳的已有年龄也计入 watchdog。
+
+`trajectory_mode` 为 `0/1/2` 时，`radio` 分别限制为 `0`、`0..100`、`0..1000`。Action IDL 使用 `uint16 radio`，可完整表达滤波模式的官方范围。
+
+session 终止结果保留原始 API2 status 和 message 给 Action 调用方。已停止、无 ownership、无 lockout、无 worker 或 pending reservation 时，后续 `shutdown()` 返回 `0`；仍有停止失败 lockout 时继续返回真实非零状态。这样成功的 `/disconnect` 不会被历史 Action 错误误报为失败，同时当前未解决的物理安全状态仍会阻止成功结果。
+
+先在一个终端启动 session；goal 的周期、watchdog 和加速度不能超过该臂配置：
+
+```bash
+ros2 action send_goal /l/cartesian_velocity \
+  realman_msgs/action/CartesianVelocity \
+  "{reference_type: 1, reference_name: cell, control_period_ms: 10, \
+    watchdog_ms: 100, max_linear_accel_mps2: 0.10, \
+    max_angular_accel_radps2: 0.50, follow: false, \
+    trajectory_mode: 0, radio: 0}" --feedback
+```
+
+在另一个同 domain 终端按固定频率发布 `TwistStamped`；Humble CLI 的 `stamp: now` 会为每条消息填写当前时间，frame 必须与 session 对应：
+
+```bash
+ros2 topic pub --rate 20 /l/cartesian_velocity/command \
+  geometry_msgs/msg/TwistStamped \
+  "{header: {stamp: now, frame_id: l/work/cell}, \
+    twist: {linear: {x: 0.01}, angular: {z: 0.05}}}"
+```
+
+空 frame 或与 session 不一致的 frame 都会被拒绝。WORK/TOOL 的 frame 取自 `config/ros/realman_coordinates.yaml` 中当前已验证坐标的 `ros_frame_id`；在 Goal 中把 `control_period_ms` 设为该臂配置周期（l/r 为 `10`，m 为 `20`），否则 Goal 会被拒绝。停止发布超过 watchdog 后，session 会发送一次受控停止并返回 `WATCHDOG_STOP`；也可取消 Action 进行受控停止。
+
+## 参数
+
+运行参数由根目录三个文件共同负责：`realman_driver.yaml` 包含 `/l/realman_driver`、`/m/realman_driver` 和 `/r/realman_driver` 三个完整节点名，坐标与运动上限分别由 `realman_coordinates.yaml` 和 `realman_motion.yaml` 负责。
+
+| 参数 | 默认策略 | 约束 |
+| --- | --- | --- |
+| `robot_model` | `RM65-B` | 必须与控制器和 URDF 型号一致 |
+| `robot_ip` | `l=192.168.30.123`、`m=192.168.30.125`、`r=192.168.30.124` | 必须与现场控制器网络一致 |
+| `robot_port` | `8080` | 有效 TCP/SDK 端口范围 `1..65535` |
+| `thread_mode` | `RM_TRIPLE_MODE_E` | 当前必须为三线程；普通运动完成事件依赖 SDK callback |
+| `mock_mode` | `false` | `true` 时不导入 SDK，不访问任何控制器 |
+| `auto_connect` | `true` | 启动时连接并开始回读；设为 `false` 可手动调用 `connect` |
+| `reconnect_interval` | `5.0` 秒 | 连接失败、断线或事件通道隔离后的重连/恢复周期；`0.0` 禁用 |
+| `state_publish_rate` | `10.0` Hz | 必须大于零；后续应按网络和控制器能力测定 |
+| `publish_joint_currents` | `true` | 随每次 `joint_states` 发布 `joint_currents`（mA，`effort`）；每拍多一次 SDK 读取 |
+| `coordinate_state_publish_rate` | `1.0` Hz | 必须大于零；低频重发最近一次完整坐标校验结果，覆盖首个样本早于 DDS endpoint discovery 的启动时序 |
+| `passthrough_reanchor_mode` | `canfd_current` | 每次普通运动前重新锚定 CANFD 透传目标，避免下个速度 session 被拉向旧位姿；只有该值经真机验证（见[Pika 遥操作](./pika-teleop#每次速度-session-启动时手臂被拉动-已在-driver-中修复)）。不在 `realman_driver.yaml` 中，使用节点默认值 |
+| `velocity_start_trace` / `velocity_init_settle_ms` | `false` / `0.0` | 诊断：记录速度 session 启动前后的关节角和节拍；`init` 之后的等待毫秒数 |
+| `joint_names` | `joint_1` 到 `joint_6` | 数量必须与 SDK 返回的自由度一致 |
+| `coordinates_config_file` | `config/ros/realman_coordinates.yaml` | 工具/工作坐标和启动验证策略的权威配置 |
+| `motion_config_file` | `config/ros/realman_motion.yaml` | 每臂速度、加速度、控制周期、watchdog 和停止超时的权威配置 |
+
+先用试算器直观感受"普通会话上限 / Pika 限值 / 硬上限"三层限制，再看下面的参数表：
+
+<LimitExplorer />
+
+`realman_motion.yaml` 对 `l/m/r` 分别定义下列字段，所有值必须为正且有限。每个字段在文件中都有注释说明用途；**数值以该文件为准**，下表只列出当前值和约束，避免本页与配置漂移。
+
+| 字段 | l / r | m | 单位/用途 |
+| --- | --- | --- | --- |
+| `default_timeout_sec` | `10.0` | `10.0` | 普通运动默认 deadline，秒 |
+| `max_linear_speed_mps` | `0.15` | `0.05` | **普通会话**线速度上限（Web、键盘、行为树、Pika Mixed），m/s |
+| `max_angular_speed_radps` | `0.25` | `0.25` | 普通会话角速度上限，rad/s |
+| `hard_max_linear_speed_mps` | `1.0` | `0.05` | 单 session 绝对上限；仅 Pika 速度 Goal 显式申请时可超过普通上限 |
+| `hard_max_angular_speed_radps` | `2.0` | `0.25` | 同上，角速度 |
+| `velocity_control_period_ms` | `10` | `20` | SDK 速度控制周期；driver 每臂只接受该周期（l/r 高跟随需要 10 ms） |
+| `velocity_watchdog_ms` | `100` | `100` | 最新有效命令超时，ms |
+| `max_linear_accel_mps2` | `0.10` | `0.10` | 普通会话线加速度上限 |
+| `max_angular_accel_radps2` | `0.50` | `0.50` | 普通会话角加速度上限 |
+| `hard_max_linear_accel_mps2` | `2.0` | — | Pika 速度 Goal 可申请的线加速度上限（m 臂未配置） |
+| `hard_max_angular_accel_radps2` | `4.0` | `0.50` | Pika 速度 Goal 可申请的角加速度上限 |
+| `joint_goal_tolerance_deg` | `0.25` | `0.25` | MOVEJ 每关节完成容差，度 |
+| `stop_timeout_sec` | `2.0` | `2.0` | 等待轨迹确认 inactive 的上限，秒 |
+| `pose_max_joint_speed_dps` | `30.0` | `30.0` | 位姿 session 经 CANFD 透传时每关节每秒最大逼近角度 |
+
+"普通"与"hard"两层限制的作用：普通客户端只会被限制在 `max_*`，只有 Pika 在 Goal 中显式写入更高数值时才使用 `hard_max_*`，提高 l/r 硬上限不会放宽其它客户端。
+
+真机地址只能在根目录 `config/ros/realman_driver.yaml` 修改。不要把 IP、端口或型号散落到 launch 文件、Dockerfile 或源代码中。
+
+SDK 依赖由根目录 `config/python/realman-sdk-requirements.txt` 锁定为 `Robotic_Arm==1.1.6`，Docker 构建时安装。
+
+真实三线程模式下，SDK 的 `rm_get_arm_event_call_back()` 要求
+`rm_event_callback_ptr`（ctypes 回调指针），不能直接传入普通 Python callable。
+`RealManSdkAdapter` 在硬件模式下负责创建并保留这个桥接指针，把
+`rm_event_push_data_t` 转成 Action 协调器使用的字典；mock 模式仍使用普通 Python
+回调。回调注册失败会保留 API2 状态并释放本臂句柄，驱动随后按 `reconnect_interval` 重试，
+不会把未确认的轨迹报告为成功。取消后事件通道进入隔离时，状态定时器也会在后台重复执行
+disconnect、冷却、connect、回调注册和 inactive reconciliation；失败只让当前 arm 保持
+`connected=false` 和运动安全门禁，不会退出驱动节点，也不会影响其他 arm。
+
+## 独立启动
+
+Docker mock 测试，不会访问 `192.168.30.*`：
+
+```bash
+docker compose build realman_driver_test
+docker compose run --rm realman_driver_test
+```
+
+也可以加载 Zsh 函数后运行：
+
+```zsh
+source ./functions.zsh
+rm65_docker_driver_test
+```
+
+独立启动真实三臂驱动：
+
+```bash
+source /opt/ros/humble/setup.bash
+colcon build --symlink-install --packages-select realman_robot_driver
+source install/setup.bash
+ros2 launch realman_robot_driver three_realman_drivers.launch.py \
+  config_file:=/path/to/realman_pi/config/ros/realman_driver.yaml
+```
+
+真机回读话题：
+
+```bash
+ros2 topic echo /l/joint_states
+ros2 topic echo /m/joint_states
+ros2 topic echo /r/joint_states
+ros2 service call /r/status std_srvs/srv/Trigger {}
+```
+
+`joint_states.position` 是弧度，不是睿尔曼 SDK 的角度制。三台驱动使用独立 SDK 句柄，分别对应 `l/m/r` 和上面的三个 IP。
+
+## 单臂 SDK 最小探针
+
+当需要区分控制器网络/SDK 连接问题与 ROS 2、TF 或 RViz 编排问题时，可运行驱动包内的
+只读 Python 探针。它只执行 `rm_create_robot_arm()`、`rm_get_joint_degree()` 和资源释放，
+不会发送运动、停止、IO 或配置指令。
+
+在远程主机上先将目标控制器地址放入当前 shell，再使用无图形的 Compose 服务执行：
+
+```bash
+export REALMAN_ROBOT_IP='<controller-ip>'
+docker compose run --rm --no-deps realman_bringup_remote \
+  python3 -m realman_robot_driver.connection_probe \
+  --robot-ip "$REALMAN_ROBOT_IP" \
+  --robot-port 8080 \
+  --connect-level 3 \
+  --thread-mode 2 \
+  --refresh-interval 0.05 \
+  --print-every 4 \
+  --samples 8
+```
+
+这里的 `--thread-mode 2` 是 SDK 的 `RM_TRIPLE_MODE_E` 数值，`--connect-level 3` 与
+官方 `rm_create_robot_arm()` 默认连接等级一致。成功时应看到 `connected` 和若干
+`joint_degrees` 样本；失败时命令以非零状态退出，并保留 API2 返回码。只需验证句柄和
+一次状态读取时，将 `--samples` 设为 `1`。
+
+`auto_connect` 对真实和 mock 模式都生效。mock 模式启动后立即建立内存连接并以
+`state_publish_rate` 发布六轴零位，因此可以在没有控制器的情况下验证 ROS 图、单位转换和
+TF 消费关系。
+
+真实状态直接驱动 RViz 2：
+
+```bash
+docker compose build realman_driver_rviz
+docker compose run --rm realman_driver_rviz
+```
+
+该服务启动三台驱动、三棵带前缀的 `robot_state_publisher` TF 树和 RViz 2，不启动手柄节点。RViz 的三个 RobotModel 分别使用 `/l/robot_description`、`/m/robot_description` 和 `/r/robot_description`，固定坐标系为 `world`。
+
+离线验证完整数据链路：
+
+```bash
+docker compose run --rm -e ROS_DOMAIN_ID=168 realman_driver_test bash -lc '
+  ros2 launch realman_bringup system.launch.py \
+    start_driver:=true \
+    driver_config_file:=/opt/rm65_ws/config/ros/realman_driver_mock.yaml \
+    start_joy_driver:=false start_controller:=false \
+    use_gui:=false use_rviz:=false
+'
+```
+
+在另一个同一容器或同一 ROS domain 的终端检查：
+
+```bash
+ros2 node list
+ros2 topic info /l/joint_states --verbose
+ros2 topic info /m/joint_states --verbose
+ros2 topic info /r/joint_states --verbose
+ros2 run tf2_ros tf2_echo world l/link_6
+ros2 run tf2_ros tf2_echo world m/link_6
+ros2 run tf2_ros tf2_echo world r/link_6
+```
+
+预期每个 `joint_states` 只有对应 `realman_driver` 一个发布者，并由对应的
+`robot_state_publisher` 订阅；`world -> l/m/r/link_6` 均可持续查询。节点列表中不应出现
+`joint_state_publisher`，否则说明假关节状态源没有被驱动模式禁用。
+
+运动接口的 mock graph 还应包含 12 个 Action（每臂 `execute_motion`、`execute_trajectory`、`cartesian_velocity`、`cartesian_pose`）、12 个坐标 Service、3 个
+`recover_motion` Service，以及 3 个速度命令和 3 个位姿命令 topic：
+
+```bash
+ros2 action list
+ros2 service list | grep '/coordinates/'
+ros2 service list | grep '/recover_motion'
+ros2 topic list | grep -E '/cartesian_(velocity|pose)/command'
+```
+
+mock 普通运动会依次报告 active、inactive 和成功完成事件，因此 MOVEJ、MOVEL、MOVEJ_P 使用各自目标字段时均应返回 `success: true`、`terminal_state: 0`、`api2_status: 0`。这是 ROS 协议和状态机验证，不代表真实机械臂执行或安全验证。
+
+## 与描述 Bringup 的关系
+
+`rm65_description/three_robots.launch.py` 支持两种互斥的关节状态源：
+
+- 模型查看：默认使用 `joint_state_publisher` 的假状态；
+- 真机运行：使用 `use_driver_joint_states:=true`，禁用假状态，接收 `realman_robot_driver` 发布的真实状态。
+
+统一 `realman_bringup/system.launch.py` 默认启用第二种模式，并透传 `start_driver` 控制驱动和关节状态源。
+
+## 日志
+
+节点只使用 `rclpy` 官方日志接口。独立 launch 设置 `RCUTILS_COLORIZED_OUTPUT=1`，并在 `REALMAN_LOG_ROOT` 下创建 `YYYYMMDD_HHMMSS` 目录作为 `ROS_LOG_DIR`。launch 通过 namespace 设置进程 argv0，因此 Docker 继承的项目根目录 `logs/` 中会生成 `l_realman_driver_<pid>_<timestamp>.log`、`m_realman_driver_<pid>_<timestamp>.log` 和 `r_realman_driver_<pid>_<timestamp>.log`。
+
+状态轮询错误只在错误码变化时打印，避免每个定时周期刷屏。连接失败日志保留 API2 状态和 SDK 异常详情，但不记录密码或凭据。
+
+收到 launch 的 `SIGINT` 或 ROS context 外部关闭时，节点先释放 SDK 连接，再销毁 ROS
+资源；重复关闭不会再次调用无效 context。正常 Ctrl-C 的三个驱动进程都应显示
+`process has finished cleanly`，不应出现 Python traceback。
+
+## 真机运行门槛
+
+真机验收必须由现场操作人员执行，本轮自动化验证不包含任何真实连接、运动、停止或坐标写入。按以下顺序逐级放行，任一步的 API2 状态非零、回读不一致或停止无法确认时立即停止后续步骤：
+
+1. 记录 Python、`Robotic_Arm`、控制器固件、控制层、规划层、算法和动力学版本；Docker 使用 `config/python/realman-sdk-requirements.txt` 固定客户端版本。
+2. 核对工业交换机侧网卡路由和三臂映射：左臂 `192.168.30.123`、中臂 `192.168.30.125`、右臂 `192.168.30.124`，端口均为 `8080`。无线远程链路不能替代工控机到机械臂局域网的有线可达性。
+3. 逐臂运行“单臂 SDK 最小探针”，只创建句柄并读取关节；确认返回型号、六轴角度和资源释放，不启动 ROS 运动接口。
+4. 使用 `realman_driver_rviz` 只观察 `/l|m|r/joint_states`、连接状态、TF 和 RViz 姿态；核对厂商度数到 ROS 弧度的转换及左/中/右模型对应关系。
+5. 对每臂调用 `coordinates/verify`，只读比对当前工具/工作坐标。启动连接时若可读但 mismatch，驱动会自动执行与 `coordinates/apply` 相同的写入、选择和回读流程；请先核对 `realman_coordinates.yaml` 中工具 payload、质心和位姿参数，再允许真机启动。
+6. 清空工作区、限制负载、确认碰撞设置，安排一名人员保持可触达现场急停。一次只允许一个 arm namespace 取得 ownership，先以低 `velocity_percent` 执行经人工确认可达的小幅 MOVEJ。
+7. 检查 Action 的 VALIDATING/SUBMITTING/EXECUTING 反馈、当前关节角、API2 状态以及最终 active-to-inactive 证据；随后单独验证 cancel 和 `/stop` 的最快受控停止，并在 cancel 结果后调用一次 `recover_motion`。这些接口都不是断电急停。
+8. MOVEL/MOVEJ_P 从已知安全位姿开始，先核对 `reference_type`、控制器 `reference_name`、位置单位 m 和四元数 `wxyz`，再使用低速度执行；不要在奇异位形、软件限位或共享工作区边界附近测试。
+9. 在两个已人工确认安全的小幅 MOVEJ 点之间测试 `execute_trajectory`，中间点使用低
+   交融半径；确认轨迹不在路点处完全停下，随后单独验证整条队列 cancel。
+10. 末端速度 session 先持续发布六轴零速度，再只开放一个低幅线速度轴；验证加速度限制后停止发布，让 watchdog 自动停止。随后分别验证角速度、Action cancel 和显式 `/stop`，整个过程中保持固定 `control_period_ms`。
+11. 最后验证通信中断、自动重连、旧时间戳命令拒绝、lockout、`disconnect` 清理和重新 `verify`。每次验收记录命令、目标、返回码、日志目录和现场观察，不以重复下发掩盖错误。
+
+接口和版本依据见[睿尔曼 Python 驱动查询 Skill](./realman-python-driver)。后续每增加一个运动、力控或 IO 接口，都要同时补适配器测试、ROS 接口测试、失败路径和本页契约。
+
+## 当前限制
+
+- SDK 版本由 `config/python/realman-sdk-requirements.txt` 锁定；真实控制器、网络连通性和固件兼容性仍需现场确认。
+- 连接和状态读取当前在 ROS executor 线程中同步执行；生产实现需要避免网络阻塞占用关键回调线程。
+- 已实现断线原地重连、速度/位姿命令专项 QoS 和 `controller_info` 只读诊断；尚未实现关节状态陈旧检测和 `diagnostic_msgs` 诊断消息。
+- 已实现普通运动、连接轨迹 Action、笛卡尔速度 session 和位姿 session；尚未实现力控、IO、Modbus、
+  UDP 和末端设备接口。
+- 新的控制器固件、网络或 SDK 版本仍需现场按运行门槛重新确认。

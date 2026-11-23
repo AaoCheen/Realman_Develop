@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<!-- Only a deliberate policy-mode selection starts the saved left-arm entry and one supervised grasp. -->
+<root main_tree_to_execute="InputControl" realman_arm_id="l" realman_required_arms="l"
+      realman_launch="control_router" realman_stop_on_terminal="false" realman_exit_on_terminal="false">
+  <BehaviorTree ID="InputControl">
+    <ReactiveSequence>
+      <SelectInputMode selected_mode="{selected_mode}"/>
+      <ReactiveFallback>
+        <ReactiveSequence>
+          <InputModeGuard mode="policy" label="Policy / 左臂单次抓取" selectable="true" selected_mode="{selected_mode}"/>
+          <Fallback>
+            <Sequence>
+              <MoveJ name="left_start" arm_id="l" dry_run="{dry_run}" joint_degrees="{pika_l_joint_degrees}"
+                     velocity_percent="5" blend_radius_percent="0" timeout_sec="120"/>
+              <GripperReady arm_id="l" dry_run="{dry_run}"/>
+              <ActivateInputMode mode="policy"/>
+              <PolicyRun arm_id="l" task="pick" dry_run="{dry_run}"/>
+              <PolicyInputStub/>
+            </Sequence>
+            <FailInputMode reason="{policy_failure_reason}"/>
+          </Fallback>
+        </ReactiveSequence>
+        <ReactiveSequence>
+          <InputModeGuard mode="none" label="无输入" selectable="true" selected_mode="{selected_mode}"/>
+          <ActivateInputMode mode="none"/>
+          <IdleInput/>
+        </ReactiveSequence>
+      </ReactiveFallback>
+    </ReactiveSequence>
+  </BehaviorTree>
+</root>

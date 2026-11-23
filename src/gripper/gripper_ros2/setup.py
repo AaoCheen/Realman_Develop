@@ -1,0 +1,25 @@
+from setuptools import find_packages, setup
+
+package_name = 'gripper_ros2'
+
+setup(
+    name=package_name,
+    version='1.0.0',
+    packages=find_packages(),
+    data_files=[
+        ('share/ament_index/resource_index/packages',
+         ['resource/' + package_name]),
+        ('share/' + package_name, ['package.xml']),
+    ],
+    install_requires=['setuptools'],
+    zip_safe=True,
+    maintainer='gripper_maintainer',
+    maintainer_email='maintainer@example.com',
+    description='ROS 2 wrapper for Changingtek gripper (Modbus RTU).',
+    license='BSD-3-Clause',
+    entry_points={
+        'console_scripts': [
+            'gripper_manager = gripper_ros2.gripper_manager_node:main',
+        ],
+    },
+)

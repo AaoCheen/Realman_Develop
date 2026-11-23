@@ -1,0 +1,94 @@
+# Desired controller coordinate profiles for the three fixed RM65 arms.
+# The configured frames are authoritative. Startup verifies and automatically
+# reconciles a readable mismatch by writing/selecting these frames, then reading
+# them back. Read/write failures keep motion blocked.
+
+version: 1
+policy:
+  # Legacy compatibility field; startup always verifies and reconciles mismatch.
+  on_start: verify
+  # A controller/profile discrepancy is reconciled at startup; failures block motion.
+  on_mismatch: block_motion
+
+robots:
+  l:
+    default_tool: tcpgrip
+    default_work: cell
+    tools:
+      tcpgrip:
+        # RealMan controller names are limited to 9 usable ASCII characters.
+        controller_name: tcpgrip
+        # TF frame IDs are namespaced to prevent collisions between arms.
+        ros_frame_id: l/tool/tcpgrip
+        pose:
+          # Tool origin in metres; Euler angles are intentionally not authoritative.
+          xyz_m: [0.0, 0.0, 0.120]
+          # Unit quaternion in w, x, y, z order; loader normalizes valid input.
+          quaternion_wxyz: [1.0, 0.0, 0.0, 0.0]
+        # Payload mass in kilograms and centre of mass in metres from tool origin.
+        payload_kg: 0.80
+        center_of_mass_m: [0.0, 0.0, 0.060]
+    work_frames:
+      cell:
+        controller_name: cell
+        ros_frame_id: l/work/cell
+        pose:
+          # Work origin in metres; use calibrated values only after explicit apply.
+          xyz_m: [0.0, 0.0, 0.0]
+          quaternion_wxyz: [1.0, 0.0, 0.0, 0.0]
+      pikabase:
+        controller_name: pikabase
+        ros_frame_id: l/work/pikabase
+        pose:
+          # RealMan velocity has no BASE mode; this identity WORK frame preserves
+          # Pika's per-arm BASE-expressed Cartesian vectors.
+          xyz_m: [0.0, 0.0, 0.0]
+          quaternion_wxyz: [1.0, 0.0, 0.0, 0.0]
+
+  m:
+    default_tool: tcpgrip
+    default_work: cell
+    tools:
+      tcpgrip:
+        controller_name: tcpgrip
+        ros_frame_id: m/tool/tcpgrip
+        pose:
+          xyz_m: [0.0, 0.0, 0.120]
+          quaternion_wxyz: [1.0, 0.0, 0.0, 0.0]
+        payload_kg: 0.80
+        center_of_mass_m: [0.0, 0.0, 0.060]
+    work_frames:
+      cell:
+        controller_name: cell
+        ros_frame_id: m/work/cell
+        pose:
+          xyz_m: [0.0, 0.0, 0.0]
+          quaternion_wxyz: [1.0, 0.0, 0.0, 0.0]
+
+  r:
+    default_tool: tcpgrip
+    default_work: cell
+    tools:
+      tcpgrip:
+        controller_name: tcpgrip
+        ros_frame_id: r/tool/tcpgrip
+        pose:
+          xyz_m: [0.0, 0.0, 0.120]
+          quaternion_wxyz: [1.0, 0.0, 0.0, 0.0]
+        payload_kg: 0.80
+        center_of_mass_m: [0.0, 0.0, 0.060]
+    work_frames:
+      cell:
+        controller_name: cell
+        ros_frame_id: r/work/cell
+        pose:
+          xyz_m: [0.0, 0.0, 0.0]
+          quaternion_wxyz: [1.0, 0.0, 0.0, 0.0]
+      pikabase:
+        controller_name: pikabase
+        ros_frame_id: r/work/pikabase
+        pose:
+          # RealMan velocity has no BASE mode; this identity WORK frame preserves
+          # Pika's per-arm BASE-expressed Cartesian vectors.
+          xyz_m: [0.0, 0.0, 0.0]
+          quaternion_wxyz: [1.0, 0.0, 0.0, 0.0]

@@ -1,0 +1,83 @@
+# Browser-to-ROS bridge settings for the three RealMan arms.
+#
+# The Web UI is intentionally reachable on the trusted robot LAN. Any browser
+# that can reach this service can send motion and stop commands.
+server:
+  # Listen on every interface so a laptop can open the industrial PC's address.
+  bind_host: 0.0.0.0
+  port: 8765
+  # same-origin accepts browsers that loaded the UI from this server. Add exact
+  # http(s) origins only when a separate trusted frontend is deliberately used.
+  allowed_origins: [same-origin]
+  max_clients: 8
+  # Reject oversized WebSocket frames before parsing JSON.
+  max_message_bytes: 65536
+
+# Optional running input router is discovered over ROS; its XML owns the catalog.
+input_mode:
+  discovery_period_sec: 1.0  # Seconds between bounded router service probes.
+  web_override_timeout_sec: 5.0  # No Web Action is sent after this wait expires.
+
+# Read-only behavior-tree view on :8765. bt-start runs the executor's monitor on
+# this port (BT_SERVER_PORT) while a tree is loaded; the Web server reads its
+# /api/runtime and pushes each change to open pages as a bt_runtime /ws event.
+behavior_tree_monitor:
+  url: http://127.0.0.1:8080  # Empty string disables the tree view.
+  timeout_sec: 0.5  # Per-request limit; an unreachable monitor reads as "no tree".
+  stale_after_sec: 5.0  # Hide snapshots the executor has not rewritten for this long.
+  poll_period_sec: 0.05  # Re-read the monitor this often while a page is open; changes are pushed over /ws.
+
+# Start menu on :8765. bt_launcher (realman_bringup_remote, start_bt_launcher:=true)
+# runs bt-start like ./scripts/bt.sh; paths are relative to the config root.
+behavior_tree_launcher:
+  url: http://127.0.0.1:8781  # Empty string hides the start menu.
+  timeout_sec: 2.0
+  tree_dir: behavior-trees  # Every *.xml here is offered.
+  favorites_file: web-control/behavior-trees/favorites.yaml  # Shared pins; needs the rw mount.
+
+# "重启 Docker" button on :8765. scripts/docker_restart_helper.py runs on the robot host
+# (./rm65 restart-helper install) and only restarts services whitelisted in
+# config/docker/restart_helper.json. The browser cannot choose the service.
+docker_restart:
+  url: http://127.0.0.1:8782  # Empty string hides the button.
+  timeout_sec: 2.0  # Per-request limit; the restart itself runs in the helper.
+  service: realman_bringup_remote
+
+# "Pika 速度控制" switch on :8765. scripts/pika_process_helper.py runs on the robot host
+# (./rm65 pika-helper install) with the commands in config/docker/pika_helper.json.
+# On: start the Pika stack, wait for /pika/{l,r}/cartesian_velocity, select `mode`.
+# Off: select `off_mode`, then stop the Pika stack.
+pika_switch:
+  helper_url: http://127.0.0.1:8783  # Empty string hides the switch (or no helper answers).
+  # Per helper call. Above the helper's worst start (status 5 + leftover cleanup 7 + timeout_sec 20 + status 5 s)
+  # and worst stop (stop_grace_sec 15 + kill + leftover cleanup 7 s + status probes).
+  # A start/stop with no answer after this + 5 s fails the switch.
+  helper_timeout_sec: 40.0
+  input_fresh_ms: 500  # Both l and r Pika velocity must be newer than this.
+  input_wait_timeout_sec: 30.0  # Stack started but no Pika data from an arm -> failed (stack stays up).
+  status_poll_sec: 2.0  # Helper status poll; shows a stack started or stopped by hand.
+  mode_switch_timeout_sec: 150.0  # Covers the entry MoveJ (pika_default_pose.timeout_sec 120).
+  off_mode_timeout_sec: 10.0  # Off step: wait this long for `off_mode`, then stop the stack anyway.
+  mode: pikavelocity
+  off_mode: none
+
+param_tuning:
+  catalog_file: web-control/param_catalog.yaml  # The /params.html page; empty string disables it. Writes need ./config/ros mounted read-write.
+  readback_timeout_sec: 0.5  # Per-node GetParameters wait for the 运行值 column.
+
+# Topbar link strip on :8765 (GET /api/links): one dot per arm, camera and gripper, hover for
+# details. Cameras come from cameras_ros2.yaml (+ cameras_ros2.local.yaml), arm addresses from
+# realman_driver.yaml, gripper ports from gripper.yaml plus each gripper's /<name>/link topic,
+# Pika sides from recording.yaml plus the Pika switch, /foot_pedal/enabled and /pika_episode/state.
+link_status:
+  arms: [l, m, r]  # Arms shown; drop one that is normally powered off on this station.
+  rate_window_sec: 2.0  # joint_states / camera_info rate is counted over this window.
+  stale_after_sec: 1.0  # No message for this long -> down (red).
+  low_rate_ratio: 0.7  # Below this share of the expected rate -> warn (amber).
+  prefer_usb3: true  # A camera that negotiated USB 2.0 or slower shows amber.
+  usb_devices_root: /sys/bus/usb/devices  # Host USB tree; sysfs is visible inside the container.
+  gripper_link_stale_sec: 5.0  # /<name>/link older than this is ignored (gripper_manager gone).
+  # Pika dots: sides and pose topics come from recording.yaml (/recording_web_bridge pika_*), so a
+  # Wi-Fi Pika host's throttled /pika_web/pose_* is used and the raw poses never cross the link.
+  pika_expected_pose_hz: 20.0  # Pose rate below low_rate_ratio of this -> warn (0 disables).
+  pika_active_within_sec: 0.5  # A velocity command newer than this marks the side as teleoperating.

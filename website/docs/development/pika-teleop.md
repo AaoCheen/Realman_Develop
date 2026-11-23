@@ -1,0 +1,389 @@
+---
+title: Pika 遥操作
+description: Pika 手持设备的位置、速度、Mixed 三种遥操作模式，pika_control_router 的路由、保持规则、坐标约定和 rosbag replay。
+---
+
+# Pika 遥操作
+
+Pika 是由人手持的遥操作设备。它通过 ROS 2 持续发布 l/r 两只手的位姿、速度和夹爪开合度；`realman_bt` 的
+`pika_control_router` 按行为树当前选中的输入模式，把这些数据转成 RealMan 驱动的 Action session 和夹爪 command。
+Pika **只控制 l/r，绝不订阅或发送 m 的任何信号**。本页是 Pika 的开发契约；输入模式的选择、`control.xml`、
+键盘与 Web override 见[行为树控制权与 Mock 测试](./behavior-tree-control)。
+
+## 数据流
+
+```text
+Pika 遥操作主机（pika_teleop_ws，标称 20 Hz / 50 ms 周期）
+  /pika/l|r/cartesian_pose        geometry_msgs/PoseStamped     base_link 帧
+  /pika/l|r/cartesian_velocity    geometry_msgs/TwistStamped    work/pikabase 帧
+  /pika/l|r/gripper_percentage    std_msgs/Float32              0 闭合 … 1 张开
+        │
+        ▼
+pika_control_router（realman_bt，与 realman_bt_executor 同一 launch）
+  只在 pikaposition / pikavelocity / pikamixed 为 ACTIVE 时转发
+        │
+        ├── /l|r/cartesian_velocity (Action) + /command   → 速度 session   (pikavelocity)
+        ├── /l|r/cartesian_pose     (Action) + /command   → 位姿 session   (pikaposition、pikamixed)
+        └── /gripper_left|right/percentage/command        → gripper_manager
+```
+
+调试 Pika 发送端与机械臂两端的方法见仓库 skill `debugging-pika-teleop-two-ends`；回放录制数据见本页[rosbag replay](#pika-rosbag-replay)。
+
+## 三种模式
+```mermaid
+flowchart LR
+  SEL["Web 选择 Pika 模式"] --> PREP["ThreeArmMoveJ<br/>到 pika_default_pose"]
+  PREP -- 失败/取消 --> FAIL["不进入 ACTIVE"]
+  PREP -- 成功 --> ACT["ACTIVE"]
+  ACT --> M{"模式"}
+  M -- pikavelocity --> V["CartesianVelocity<br/>follow=false，10 ms"]
+  M -- pikaposition --> P["CartesianPose<br/>IK + CANFD 透传"]
+  M -- pikamixed --> X["单个 CartesianPose<br/>XYZ=速度积分，姿态=相对转动"]
+```
+
+
+| 模式 ID | 浏览器选项 | 输入 | driver 侧 session | 适用场景 |
+| --- | --- | --- | --- | --- |
+| `pikaposition` | Pika / 位置控制 | `cartesian_pose`（绝对位姿） | `CartesianPose`：IK + `rm_movej_canfd` 关节透传 | 末端绝对位置跟随 |
+| `pikavelocity` | Pika / 速度控制 | `cartesian_velocity`（`work/pikabase`） | `CartesianVelocity`：`follow=false`，l/r 周期 `10 ms` | 手速直接映射为末端速度，可离合 |
+| `pikamixed` | Pika / Mixed 控制 | 速度（XYZ）+ 位姿（姿态） | 单个 `CartesianPose` session | 位置用速度积分（可离合），姿态跟随手的旋转量（不漂移） |
+
+三种模式共用同一套门控：进入前由行为树先用 `ThreeArmMoveJ` 把 l/m/r（`skip: true` 的臂除外）移到 `pika_default_pose`，成功后才发布
+`ACTIVE`；其它模式下 router 丢弃 Pika 输入，不自动开合夹爪。
+
+### 交互：逐个模式看数据怎么走
+
+点一个模式，看它的输入、router、driver session、参考系和关键限值。模式列表和数字都是构建时从 `control.xml` 与各 YAML 复制的，不会和配置脱节。
+
+<ModeExplorer />
+
+## 路由与门控
+
+同一 launch 还启动 `pika_control_router`。它接收 executor 的 active mode，并只为 l/r 管理 Pika
+Action session，同时将夹爪百分比转发到 `/gripper_left/percentage/command` 和
+`/gripper_right/percentage/command`。只有 `pikaposition`、`pikavelocity` 或 `pikamixed` 处于 `ACTIVE` 时才转发；
+其它模式会丢弃输入，不自动开合。夹爪 command topic 是非阻塞的连续控制路径，`dry_run=true`
+（默认）时不发送机器人 Action 或夹爪 command。需要真实 Pika 运动时必须显式设置
+`REALMAN_BT_DRY_RUN=false`，并完成低速、急停和工作区检查。
+
+
+## 速度模式（`pikavelocity`）
+
+::: tip 试一试
+下面的试算器按真实配置计算：选臂和客户端，拖动请求速度，看哪一层限值生效、加速到该速度要多久。
+:::
+
+<LimitExplorer />
+
+`pikavelocity` 是实时速度流，而不是单点位置目标。其逐会话限值来自
+[`config/ros/pika_config.yaml`](https://github.com/QingTianRobot/realman_pi/blob/main/config/ros/pika_config.yaml) 的 `pika_velocity`：线速度
+`max_linear_speed_mps=0.25 m/s`、角速度 `max_angular_speed_radps=0.6 rad/s`，线加速度 `max_linear_accel_mps2=2.0 m/s²`、角加速度
+`max_angular_accel_radps2=4.0 rad/s²`。前两个数取自 SDK 文档给出的 `rm_movev_canfd` 限值（`0.25 m/s`、`0.6 rad/s`）：生产上超过它们的指令会让手臂卡住，所以 Pika 现在刻意保持在限值之内（此前曾配置到 `1.0 m/s` / `2.0 rad/s`）。限值上限仍由 [`realman_motion.yaml`](https://github.com/QingTianRobot/realman_pi/blob/main/config/ros/realman_motion.yaml) 的 `hard_max_*` 给出，`pika_velocity` 不得超过它们。Pika 输入的线速度或角速度三轴
+向量模长超过上限时，router 按模长等比例缩放并保留方向，而不是丢弃整条消息；缩放诊断按每臂限频。
+Pika 速度 Goal 使用 `follow=false`，周期与键盘相同，为 l/r 的 `10 ms`（driver 每臂只接受一个周期）。
+
+Pika 速度 Action 使用 `WORK` 和 `pikabase`：driver 收到该 Goal 时，如果当前已验证工作坐标不是 `pikabase`，会在同一臂
+ownership 内调用坐标管理器写入、切换并读回验证已配置的 `pikabase`，成功后才启动速度 session；因此进入 Pika
+速度控制不要求操作员先手动把默认 `cell` 切成 `pikabase`。目标坐标未配置、写入/切换失败或读回不匹配时保持
+motion blocked，并在 Action/driver 日志中报告失败原因。限值上限由
+[`config/ros/realman_motion.yaml`](https://github.com/QingTianRobot/realman_pi/blob/main/config/ros/realman_motion.yaml) 的 `hard_max_*` 字段给出，
+`pika_config.yaml` 的 `pika_velocity` 不得超过它们。
+
+## Session 保持与重发规则
+输入新鲜度决定 session 的命运（速度模式的阈值；位置模式见下表）：
+
+```mermaid
+stateDiagram-v2
+  [*] --> 运行: 首条有效输入建立 session
+  运行 --> 零速保持: 输入晚于 stale_ms（200 ms）
+  零速保持 --> 运行: 输入恢复
+  零速保持 --> 已释放: 晚于 input_timeout_ms（3000 ms）
+  运行 --> 退避重试: driver 拒绝或自行结束
+  退避重试 --> 运行: 等待 0.5 s 后重建
+  已释放 --> [*]
+```
+
+
+
+Pika ingress 标称 `20 Hz`，生产 DDS/调度可能出现短暂抖动。两种模式都在第一条有效输入到达时建立 session，
+之后按以下规则保持：
+
+| | 速度（`pikavelocity`） | 位置（`pikaposition`） |
+| --- | --- | --- |
+| 输入新鲜 | 按 `10 ms` 周期重打时间戳后重发最新速度，DDS 抖动不会触发 driver `100 ms` watchdog | 立即转发，并按周期重发最新目标位姿 |
+| 输入晚于阈值 | 晚于 `stale_ms`（`200 ms`）即刷新**零速度**，session 保留 | 继续重发最后目标位姿，机械臂停在最后目标，session 保留 |
+| 输入丢失 | 晚于 `input_timeout_ms`（`3000 ms`）发布零速度并取消 | 晚于 router `watchdog_ms`（`3000 ms`）取消 |
+| driver 拒绝或自行结束 | 等待 `0.5 s` 再重试 | 等待 `0.5 s` 再重试 |
+
+速度模式以前在上游中断后会**持续重发最后一个速度长达 3 s**，Pika 流一停机械臂仍按原速度运动；
+`stale_ms` 把这段时间缩短到 `200 ms` 并改为零速度。位置模式以前只在 Pika 消息到达时转发，任何超过
+`100 ms` 的间隔都会触发 driver 位姿 watchdog（日志 `pose command watchdog expired`）并随后重建 session。
+位姿 Goal 的 `watchdog_ms` 使用 driver 配置的 `100 ms`，而不是 router 的 `3000 ms` 输入丢失窗口
+（driver 会拒绝超过 `velocity_watchdog_ms` 的 Goal watchdog）。转发的位姿一律使用 router 当前 ROS 时间戳，
+以保证与重发的目标严格递增。
+
+与键盘相同，每次 Pika 激活后的 session 重开会以 `restart #N` warning 记录，结束日志会写明
+`position` 或 `velocity`。这些都不放宽 driver watchdog：router 崩溃或到 driver 的发布中断时，driver 仍在
+`100 ms` 内停止。
+
+## Mixed 模式（`pikamixed`）
+
+Mixed 模式把两路 Pika 输入组合成**一个绝对位姿 session**（`/<arm>/cartesian_pose`，与 Pika 位置模式相同的
+IK + 关节透传执行路径）：
+
+| 自由度 | 来源 | 处理 |
+| --- | --- | --- |
+| XYZ | `/pika/<arm>/cartesian_velocity` 的线速度（`l|r/work/pikabase`，即基座方向） | router 按模长限速、按加速度限幅，积分成绝对目标位置；角速度分量被忽略 |
+| 姿态 | `/pika/<arm>/cartesian_pose` 的四元数，取**相对 session 开始时的转动量** | 目标姿态 = `q_pika · q_pika0⁻¹ · q_arm0`，以不超过 `max_angular_speed_radps` 的角速度 slerp 逼近；位置分量被忽略 |
+
+姿态采用相对映射：session 开始后第一条有效 Pika 姿态 `q_pika0` 与锚点时的机械臂姿态 `q_arm0` 配对，之后
+Pika 在基座系中转了多少（`q_pika · q_pika0⁻¹`），机械臂就在基座系中转多少，与 XYZ 线速度使用同一坐标系。
+因此 Pika 的坐标系不需要与机械臂基座对齐，激活时手腕也不会先转向 Pika 的绝对姿态。早期版本直接跟随 Pika
+绝对四元数：两者相差约 40° 时，激活后手腕要先转向 Pika 的绝对姿态，生产日志中表现为激活 1.5–3 s 后
+IK 持续失败、机械臂停住。
+
+姿态由 Pika 的四元数直接算出，而不是积分角速度，所以长时间使用不会漂移；XYZ 仍是速度控制，可以离合、换向，
+不要求 Pika 与机械臂的绝对位置标定。**Pika 发送端在该模式下必须同时发布这两个 topic。**
+
+生命周期：
+
+1. 进入模式时和其它 Pika 模式一样，先由 `ThreeArmMoveJ` 到 `pika_default_pose`，再激活。
+2. 第一条有效输入到达后，router 调用 `/<arm>/get_current_pose`（BASE）读取当前 TCP 位姿作为锚点，然后
+   建立位姿 session；第一个目标就是锚点本身，所以 session 从静止、原地开始。锚点读取失败时退避 `0.5 s`
+   重试，不会盲目起步。
+3. 之后每个控制周期（`10 ms`）积分一步并发布目标。速度输入晚于 `stale_ms` 视为零（目标按加速度限幅减速并
+   停住），姿态输入晚于 `stale_ms` 保持当前姿态；两路都晚于 `input_timeout_ms` 才释放 session。
+4. **牵引约束**：router 以 `pose_poll_hz` 读取实测 TCP 位姿，目标位置最多领先实测 `max_position_lead_m`，
+   目标姿态最多领先实测 `max_orientation_lead_rad`。IK 失败（例如姿态不可达）或奇异导致机械臂停住时，
+   目标也随之停住，不会继续转向或跑远；把 Pika 转回或移回后立即恢复，不会突然跳向远处目标。超过 `1 s`
+   没有有效实测时，位置和姿态目标都停止前进。
+
+权威配置是 [`config/ros/pika_config.yaml`](https://github.com/QingTianRobot/realman_pi/blob/main/config/ros/pika_config.yaml) 的 `pika_mixed`：
+
+| 字段 | 默认 | 说明 |
+| --- | --- | --- |
+| `stale_ms` | `200` | 输入视为过期的时间，须大于 Pika `50 ms` 周期 |
+| `input_timeout_ms` | `3000` | 两路输入都超过此值才释放 session |
+| `max_linear_speed_mps` | `0.15` | XYZ 目标速度上限，不得超过 router 的 `0.15 m/s` |
+| `max_linear_accel_mps2` | `0.10` | XYZ 目标加速度上限 |
+| `max_angular_speed_radps` | `0.25` | 姿态逼近角速度上限，不得超过 router 的 `0.25 rad/s` |
+| `max_position_lead_m` | `0.05` | 目标可领先实测 TCP 的最大距离 |
+| `max_orientation_lead_rad` | `0.15` | 目标姿态可领先实测 TCP 姿态的最大角度 |
+| `pose_poll_hz` | `10` | 牵引约束的实测位姿读取频率 |
+
+超出 router 上限的配置会在 router 启动时被拒绝。当前生产 driver 的自定义 CasADi IK 因依赖缺失未加载，
+位姿 session 使用 SDK IK；锚点读取（SDK 正解）与执行（SDK 逆解）因此参考同一末端点。启用自定义 IK 后，
+每个位姿 session 会先比对其 TCP 与 SDK 正解，不一致时该 session 回退到 SDK IK，同样不会因 TCP 偏移跳变。
+
+Pika 速度 Action 使用 `WORK` 和 `pikabase`。driver 收到该 Goal 时，如果当前已验证工作坐标不是
+`pikabase`，会在同一臂 ownership 内调用坐标管理器写入、切换并读回验证已配置的 `pikabase`，验证成功后才
+启动速度 session；因此进入 Pika 速度控制不要求操作员先手动把默认 `cell` 切成 `pikabase`。目标坐标未配置、
+写入/切换失败或读回不匹配时仍保持 motion blocked，并在 Action/driver 日志中报告失败原因。
+
+## 进入 Pika 前的准备动作
+
+
+切入任一 Pika 模式时，行为树先用 `ThreeArmMoveJ` 将 l/m/r 移动到
+[`config/ros/pika_config.yaml`](https://github.com/QingTianRobot/realman_pi/blob/main/config/ros/pika_config.yaml) 中
+`pika_default_pose.left|middle|right.joint_degrees` 指定的关节角（单位：度），再激活 Pika。
+`control_router.launch.py` 启动时读取这三组关节角并注入行为树黑板；同一配置中的 `tcp_pose` 不参与
+这次初始 MoveJ。修改默认姿态只需更新该 YAML 并重启控制树，不要再修改 `control.xml`。准备动作失败
+或切换期间被取消时，不会进入 Pika `ACTIVE`。
+
+某台机械臂长期断电时（例如 SJDrealman 的 m 臂），在该臂下写 `skip: true`，准备动作就只移动其余两臂：
+
+```yaml
+pika_default_pose:
+  middle:
+    skip: true            # 关节角可以保留；skip 为 true 时不使用
+    joint_degrees: [0.0, 17.997, 70.0, 0.0, 90.0, 8.997]
+```
+
+launch 把它作为 `pika_m_joint_degrees: skip` 注入，`ThreeArmMoveJ` 不给该臂发 goal；策略任务的 `PolicyRun` 也不再等待、监视这条臂（见[策略任务](./policy-task.md#断电的臂)）。不写 `skip` 时三臂都移动
+（仓库默认）。`skip` 必须是布尔值，三臂不能全部跳过。没有这个设置时，断电臂的 goal 被拒绝，同步 MoveJ 随即
+取消另外两臂，驱动重置连接并隔离事件通道，行为树每 200 ms 重试一次，最终报
+`pikavelocity failed: input mode switch timed out`。
+
+## 键盘一键采集（`pika_episode_trigger`）
+
+enine 上的外接 W/A/S/D 小键盘由 `pika_foot_pedal` 节点读取（节点名沿用脚踏板，实际读的是键盘）。打开本功能后，一条示教 episode 只需要按两次键：
+
+1. 在 `:8765` 进入 `pikavelocity`（l、r 先 MoveJ 到 `pika_default_pose`）。用“Pika 速度控制”开关时可以直接进行第 2 步：开关要等按键后 Pika 发出速度才切模式，这次按键先挂起，模式到达时键盘仍为“开”就开始录制（入场 MoveJ 期间的不到 1 s 不在录制内）。
+2. 按一次 W/A/S/D：左右遥操作开始，同时 `/recording/manage` START，任务标签取自配置。
+3. 再按一次：遥操作停止，录制 STOP，同时**重启 Pika 分支**：节点以 `requester_id=pika_episode` 先选 `restart_off_mode`（默认 `none`），router 随即取消 l、r 的速度会话；该模式 ACTIVE 后再选回 `pikavelocity`，分支的入场 `ThreeArmMoveJ` 把 l、r 移回 `pika_default_pose`，完成后 router 重新接管。同时松开这两臂的夹爪（`home_open_grippers`）。`skip: true` 的臂不动，夹爪也不动。
+
+   归位不再等 Pika 速度流停下：以前节点自己发 MoveJ，要先等速度会话结束；只要 Pika 还在发速度（例如停止键之后紧跟着又按了一下），会话就一直占着手臂，MoveJ 被驱动以 `arm is busy` 拒绝。现在离开模式由 router 主动取消会话，入场 MoveJ 撞上驱动释放手臂的几毫秒空档时由行为树自己重试。
+4. 录制结束后按录制平台的 `auto_export_on_stop` 自动导出；不要的 episode 在 `:8770` 回放页隐藏或 DISCARD。
+
+节点运行在机器人主机的 bringup 里（domain 65），只消费桥过来的键盘启停状态 `/foot_pedal/enabled`（`std_msgs/Bool`）。enine 的 `pika_domain_bridge.yaml` 必须多转这个话题：
+
+```yaml
+  /foot_pedal/enabled:
+    type: std_msgs/msg/Bool
+```
+
+改完重启 enine 的 `realman-pika-bridge` 用户单元。
+
+配置在 `config/ros/pika_episode.yaml`，仓库默认 `enabled: false`；机器人主机在自己的配置里打开并填 `task`，换任务或材料时改 `task` 后重启 bringup。归位位姿不单独配置，就是 `pika_config.yaml` 的 `pika_default_pose`（分支入场 MoveJ 用的同一组值，速度也由行为树决定）；`restart_off_timeout_sec`（默认 10 s）和 `restart_timeout_sec`（默认 150 s，含入场 MoveJ）分别限定两次选模式各自变为 ACTIVE 的时间，三个 `restart_*` 键都可以不写。旧配置里的 `release_timeout_sec`、`home_velocity_percent`、`home_timeout_sec` 已不再使用，留着也不报错；归位时松开的夹爪由 `home_open_grippers`（臂 `l`/`m`/`r` → 夹爪名）指定，这个键必须写。
+
+`system.launch.py` 的 launch 参数 `start_pika_episode`（默认 `true`）会包含 `pika_episode.launch.py`，但节点仍只在 `pika_episode.yaml` 里 `enabled: true` 时才启动。该 launch 从环境变量 `REALMAN_CONFIG_ROOT` 读取配置根目录（为空或未设置时用包内安装的配置），没有对应的 launch 参数。
+
+| 情况 | 行为 |
+| --- | --- |
+| 按键时输入模式不是 `pikavelocity` | 先不开录，`detail` 写 `ignored: mode is <x>`；之后模式切到 `pikavelocity` 时，若键盘仍为“开”且键盘状态未过期（`keyboard_stale_sec`），立即开录。按键前就已为“开”（节点启动时的基线）不算 |
+| 已有别人开的录制（例如策略尝试自动录制；录制状态为 SCHEDULED、ARMED、COUNTDOWN、RECORDING 或 FINALIZING） | 按键不开录，`detail` 写 `ignored: recording busy (<session_id>)` |
+| START 被拒（预检不过）或超时 | 遥操作照常，本条不录；这次遥操作结束时仍重启分支归位（在 `pikavelocity` 里松键总会归位） |
+| 开录途中就松键 | START 成功后立即 STOP 并归位 |
+| 开录途中模式被切走 | START 成功后立即按异常停止处理：STOP，进入 FAILED，不归位 |
+| 录制中键盘状态超过 `keyboard_stale_sec`（默认 3 s）没更新（桥断）或模式被切走 | STOP 录制，进入 FAILED，不归位 |
+| STOP 失败 | 仍归位，但最终 FAILED；异常停止时 STOP 也失败则 `detail` 写 `abnormal stop: <原因>; stop failed: <消息>` |
+| 重启途中别人选了模式（:8765 或别的请求者，executor 的 `request_id` 变大） | 不再选回 `pikavelocity`；FAILED，`detail` 写 `restart failed: <x> superseded by another input mode request` |
+| 选模式被拒、进入失败或超时（例如入场 MoveJ 失败） | FAILED，`detail` 写 `restart failed: <原因>`；行为树按自己的失败处理回落模式 |
+| 行为树被停止或崩溃（`/realman_bt_executor/input_mode_state` 没有发布者了） | 按离开 `pikavelocity` 处理（模式记为 `unknown`）：录制中则异常停止，任何情况下都不归位；行为树重新启动后它的 latched 状态会恢复模式 |
+| 停止时录制已被外部结束（`/recording/status` 显示别的 session 在录，或自己的 session 已不在 COUNTDOWN/RECORDING） | 不发 STOP（录制端的 STOP 会停掉任何活动 session）；仍归位，最终 FAILED，`detail` 写 `stop failed: session already ended externally` |
+| 归位途中又按键把遥操作切回“开”（含停止键后的误连按） | 这次按键先不处理（`ignored: busy (...)`），归位照常完成；之后键盘仍为“开”且状态未过期就开始新的一条录制，Pika 速度在模式恢复后接管手臂 |
+| 启动时配置读不到或不合法 | 节点不启动，launch 日志 `pika_episode_trigger NOT started: <原因>`，bringup 其余部分不受影响 |
+| FAILED 之后 | 键盘下一次切到“开”只清除故障（这次遥操作照常但不录、结束不归位），再按一次关、一次开才开始新的一条；故障发生时键盘若是“开”（桥断、录制中切模式），要先按一次切到“关”（不起作用）。看 `/pika_episode/state` 的 `detail: cleared` 确认 |
+
+如果录制端在节点的 10 s 超时之后才回复 START 且结果为成功，节点记录一条错误日志，并 STOP 这个无人认领的 session；但 `/recording/status` 显示别的 session 正在录时只记日志、不发 STOP。
+
+归位时同时松开夹爪：节点对每条要归位的臂调用 `home_open_grippers` 里对应夹爪的 `/<夹爪名>/open`（`std_srvs/Trigger`，打到配置的开位），和分支重启一起发出、互不等待。仓库默认 `l: gripper_left`、`r: gripper_right`，写 `{}` 则不动夹爪。夹爪服务不在或返回失败（例如总线离线 `Not connected to gripper`）只记一条警告，不影响归位，也不会让这一条进入 FAILED。不会被 Pika 覆盖：enine 的 mapper 只在键盘为“开”时随速度一起发 `/pika/<臂>/gripper_percentage`（约 4 Hz），松键后不再发；下一次按键开始遥操作时夹爪重新跟随 Pika。
+
+观察状态（reliable + transient_local，JSON 含 `state`、`session_id`、`task`、`detail`、`stamp_ns`）：
+
+```bash
+ros2 topic echo /pika_episode/state --qos-durability transient_local
+```
+
+部署注意：`system.launch.py` 现在总会查找 `realman_pika_session` 包，机器人主机必须先换上重新构建的镜像再使用这版 bringup；不要把 `system.launch.py` 热拷贝到旧镜像上。
+
+## 发送端消息规范
+
+Pika 发送端应以标称 `20 Hz`（`50 ms` 周期）分别发布左右臂，消息字段如下；`header.stamp` 必须使用发送节点当前 ROS
+clock、非零且严格递增，不能重复使用旧消息：
+
+```yaml
+# /pika/l/cartesian_velocity
+header:
+  stamp: <node.get_clock().now().to_msg()>
+  frame_id: l/work/pikabase
+twist:
+  linear:  {x: 0.10, y: 0.00, z: 0.00}   # m/s
+  angular: {x: 0.00, y: 0.00, z: 0.00}   # rad/s
+```
+
+右臂只把 `frame_id` 改为 `r/work/pikabase` 并发布到 `/pika/r/cartesian_velocity`。线速度限制按
+`sqrt(vx^2 + vy^2 + vz^2)` 计算；例如 `(1, 1, 0)` 的模长约为 `1.414 m/s`，会被拒绝。
+输入晚于 `stale_ms`（`200 ms`）后 router 立即发零速但保留 session，晚于 `input_timeout_ms`（`3000 ms`）才取消 session；如果 router 到 driver 的刷新链路中断，
+driver 的 `100 ms` watchdog 仍会独立零速并终止 session。正常停止也应先连续发送零向量，然后切换到
+
+## Pika rosbag replay
+
+独立的 Pika rosbag replay 项目把 bag 中的 `l/base_link`、`r/base_link` 速度记录送入同名
+`/pika/l|r/cartesian_velocity` ingress。RealMan 的速度初始化没有 BASE 选项，因此 replay 在发送前
+选择 identity WORK aliases `l/work/pikabase`、`r/work/pikabase`，并将 `header.frame_id` 改为相应的
+`l/work/pikabase` 或 `r/work/pikabase`。Pika router 由 `pika_velocity.work_reference: work/pikabase`
+配置这个引用；其零平移和单位四元数来自
+[`config/ros/realman_coordinates.yaml`](https://github.com/QingTianRobot/realman_pi/blob/main/config/ros/realman_coordinates.yaml)，保持 BASE 速度向量
+数值不变。键盘和默认会话仍使用 `cell`。
+Replay 只发布 `/pika/l|r/cartesian_velocity` 与 `/pika/l|r/gripper_percentage`，夹爪值是
+`Float32` 的归一化百分比（`0` 闭合、`1` 张开），Pika 限制为 `0.25 m/s` 和 `0.6 rad/s`（`pika_velocity` 的当前值）。
+进入执行并尝试选择坐标后，每次结束或失败会向两路速度 ingress 发送终端零向量，等待超过 `100 ms`
+watchdog 后把已选或可能已选的坐标恢复为 `cell`；只读预检不会选择坐标或执行这段 cleanup。
+恢复失败必须先人工确认 `/<arm>/coordinates/state`，再调用 `/<arm>/coordinates/select_work` 选择 `cell`。
+夹爪不发送“零值停止”，因为 `0` 是闭合目标。
+
+Replay 不替 control tree 选择模式。操作员先启动 `REALMAN_BT_DRY_RUN=false ./rm65 bt control`，
+在 Web 页面手动选择
+`Pika / 速度控制` 并等待 `ACTIVE`，再运行独立项目的 `./replay.sh run <bag>` 只读预检，最后才由
+操作员显式添加 `--execute`。关闭 dry-run 后，手动进入 Pika 本身就会执行三臂准备运动，必须在选择
+之前确认工作区和急停。自动验证和 `inspect` 不运行真实 `--execute`；测试中的执行分支只连接 fake。
+独立项目的 `ReplayNode.spin_once()` 只在内部调度，操作员入口始终是 `replay.sh`。
+
+Replay 部署到 `$HOME/pika_realman_replay`，使用独立 Compose 与生产 ROS domain `65`，不启动或
+重启生产 driver/control tree。生命周期见 [Pika replay 边界](./behavior-tree-motion#pika-rosbag-replay-边界)，
+driver 侧契约见 [ingress 与坐标桥接](./realman-action-development#pika-rosbag-replay-的-ingress-与坐标桥接)。
+
+## 基站重标定（:8770 一键）
+
+**何时用**：Pika 一直在基站视野内，但 :8770 Pika 卡片显示 STALE / NO DATA，且 Pika 主机上
+`pika_localization_status_<side>` 为 false、追踪器 USB 仍在发数据（`/sys/bus/usb/devices/<port>/urbnum`
+持续增长）。这通常是 libsurvive 把基站位置解错了：`~/.config/libsurvive/config.json` 中某个
+`lighthouseN.pose` 与以前相比位置跳了几十厘米而朝向几乎不变，locator 日志里 `Global solve ... error of`
+比正常大一到两个数量级。2026-11-18 左 Pika 断流即此原因。
+
+**按钮做什么**：:8770「Pika 运动 3D」面板的 **重标定** 调 `POST /api/pika/recalibrate`，经回环隧道转到
+Pika 主机上的 `pika_process_helper` `POST /recalibrate`，在同一把锁里：干净停栈（含残留进程组清理）→
+把 `config.json` 改名为 `config.json.bak-YYYYMMDD-HHMMSS`（同名已存在时依次加 `-1`、`-2`、…；没有
+`config.json` 时跳过改名、只重启栈，页面也就不显示备份提示）→ 启动。libsurvive 随后从头求解基站。页面
+等待左右两侧位姿都回到 LIVE，最多 60 s。
+
+- 录制进行中（倒计时 / 录制 / 收尾）或任一侧 Pika 速度指令在发时拒绝（409），不会打断采集或遥操作。重标定进行中页面不会阻止新的录制：看到「已重新定位」之前不要开始录制。
+- 停栈不干净时不改名、不启动；改名失败不启动。
+- 60 s 内未重新定位：先在 :8765「Pika 速度控制」点 **关闭 Pika** 把栈完全停掉，再 **重新插拔两个 Pika**，然后再点一次重标定（栈已停时它只启动一次）。不要在栈运行时插拔：插拔后重启偶尔会让追踪器卡住（见下方「运行时的陷阱」）。
+- 启用条件：helper 配置 `libsurvive_config`（`config/docker/pika_helper.json`），且 `config/ros/recording.yaml`
+  的 `/recording_web_bridge` 设置 `pika_helper_url`（仓库默认空 = 隐藏按钮）。
+
+**恢复旧标定**：在 Pika 主机上先停栈，再把某个 `config.json.bak-*` 改回 `config.json`，然后启动。
+
+## 链路与已知问题
+
+以下是 2026-10-08 至 10-10 在生产机上排查 Pika 速度控制时的**现场记录**（实测数据，不是契约）。
+
+### 输入链路是 Wi‑Fi，入站会丢包
+
+Pika 主机和生产机之间**没有共同的有线网段**，唯一共用的是 Wi‑Fi，所以 20 Hz 的 `/pika/*` DDS 流走无线。生产机的无线网卡是 USB 网卡。
+
+| 测量 | 结果 |
+| --- | --- |
+| Pika 主机 → 生产机，UDP 20 包/秒、30 秒 | 丢包 **25.3%**，p95 间隔 150 ms，最大 414 ms |
+| 生产机 → Pika 主机，同样条件 | 丢包 0.0% |
+| DDS 实测（同方向） | 发 696 收 514，最大间隔 340 ms |
+| 发送端本机发布 | 20.0 Hz，最大间隔 58 ms（干净） |
+| router → driver 的 `/r/cartesian_velocity/command` | 100 Hz，最大间隔 10 ms（干净） |
+
+要点：
+
+- **`ping` 看不出来**：每秒 5 个包的 ICMP 丢包为 0%，需要用 20 pps 的 UDP 或直接数 `/pika/*` 的实际到达率。
+- 输入间隔超过 `stale_ms`（`200 ms`，见 `pika_config.yaml`）时 router 会指令**零速**，所以丢包的表现就是手臂一顿一顿（35 秒里出现过 10 次这样的间隔）。
+- router 用本机单调时钟判断输入新鲜度并重新打时间戳，所以 Pika 主机的时钟偏差（重启后可能慢几秒）**不会**影响这条链路。
+- **排查顺序**：先在两端分别量 `/pika/*` 的速率（`ros2 topic hz`），确认问题在链路上，再动 router 或 driver。解决要落在链路本身：两机之间走有线，或换非 USB 的无线网卡。尚未区分是"AP 到网卡的空口丢包"还是"网卡自身的接收路径"。
+
+### 每次速度 session 启动时手臂被拉动（已在 driver 中修复）
+
+**现象（现场实测）**：在修复之前，每次速度 session 启动，即使命令为零，手臂也会朝**上一个 session 的结束位姿**动一下。左臂（左 Pika 不动）每个 session 都漂移到同一个姿态、约 `1.54°`、约 `1.4 s`；右臂间歇出现，最大约 `27°/s` 关节速度、`0.5 m/s` TCP 速度。所有"没有指令的真实转动"事件都发生在 session 启动后 `1.3 s` 内。
+
+**原因**：控制器里保存着一个 CANFD 透传目标，它在 MoveJ、`rm_set_movev_canfd_init`、"init + 零速 + 慢停"、模式切换乃至 driver 重启之后都还在，低跟随速度 session 一启动就被拉向这个旧目标。已排除 Pika 输入和网络、router、复位 MoveJ（目标是固定默认位姿）和 driver 启动序列本身（关节变化 0.00°）。
+
+**修复**：在真机上对六种方案做了 A/B 对比，**只有**"用 `movej_canfd` 重发当前关节角"（`canfd_current`）能消除拉动；`off`、`init_zero_stop`、`stop`、`delete_current`、`delete_all` 都仍会拉。于是 driver 在每次**普通运动**（MoveJ 等）之前先重新锚定透传目标：`MotionCoordinator` 的 `before_motion` 钩子调用 `CartesianVelocitySession.prepare_for_ordinary_motion`，由 driver 参数控制：
+
+| driver 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `passthrough_reanchor_mode` | `canfd_current` | 重新锚定方式：`off`、`init`、`init_zero_stop`、`canfd_current`、`stop`、`delete_current`、`delete_all`、`cycle`（循环试验）。只有 `canfd_current` 经真机验证有效，其余保留用于诊断 |
+| `velocity_start_trace` | `false` | 诊断：在每次速度 session 启动前后记录关节角、节拍统计和控制器错误标志 |
+| `velocity_init_settle_ms` | `0.0` | `init` 之后等待的毫秒数，用于试验 |
+
+这几个参数没有写进 `realman_driver.yaml`，使用节点默认值。被拒绝的速度命令现在以 warning 记录（此前是 DEBUG）。
+
+**跟随模式**：Pika 速度 Goal 使用低跟随（`pika_velocity.follow: false`，router 参数 `pika_velocity_follow`）。高跟随在生产上让手腕振荡，并在一次超限指令之后手臂冻结，所以不用；键盘 router 仍使用高跟随。
+
+**仍未解决的问题**：向睿尔曼确认 `rm_set_movev_canfd_init` 是否应当重置内部目标，以及 `follow` 的确切含义；官方文档没有说明"目标是否重置"。修复是一个经验性的绕过，不是厂商认可的行为，换控制器固件后要重新验证。
+
+### 测量时的陷阱
+
+- driver 的 `/<arm>/cartesian_velocity/state` 里 `measured_angular_velocity_radps` 是**欧拉角 (rx, ry, rz) 的变化率**，不是真正的角速度。要真实角速度，用 TF `r/base_link → r/link_6` 的四元数做差分。有转动指令时，手臂跟随得很好（真实角速度与指令之比约 0.95，方向余弦约 0.96）。
+- `joint_states` 和速度状态 topic 按驱动的 `state_publish_rate` 发布（生产 `30 Hz`），时间精度约 `33 ms`。
+- 左臂在 Pika 不动时是干净的"零命令"试验台。
+
+### 运行时的陷阱
+
+- `./rm65 bt control` 默认 `REALMAN_BT_DRY_RUN=true`：dry-run 下 router 接收 Pika 输入但**什么都不发**，手臂"不动"是预期行为。真实运动要加 `REALMAN_BT_DRY_RUN=false`。
+- 放到后台运行的实例**忽略 `SIGINT`**，用 `SIGTERM` 停止。
+- Pika 栈重启后追踪器**偶尔会卡住**：locator 日志有 `Adding tracked object`，但没有 `watchman FW` 行、也没有位姿，追踪器 USB 的 `urbnum` 停在 0 附近。软件无法恢复：先把栈完全停掉，**重新插拔两个 Pika**，再启动一次（不要在栈运行时插拔，也不要反复重启）。
+
+## 相关页面
+
+- [行为树控制权与 Mock 测试](./behavior-tree-control)：输入模式目录、`control.xml`、模式切换与 Web override。
+- [睿尔曼 Action 开发与测试](./realman-action-development)：`CartesianVelocity` / `CartesianPose` 的 driver 侧契约。
+- [Changingtek 夹爪控制](./gripper-control)：夹爪 command 的 4 Hz 流式限速与健康门控。
+- [故障排查](../troubleshooting)：Pika 无响应、session 反复重开、坐标不匹配。

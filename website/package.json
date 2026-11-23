@@ -1,0 +1,38 @@
+{
+  "name": "realman-pi-website",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "sync-assets": "node scripts/sync-three-robots.mjs",
+    "dev": "npm run sync-assets && vitepress dev docs",
+    "build": "npm run sync-assets && vitepress build docs",
+    "dev:web-control": "vite --config ../config/web-control/vite.config.mjs",
+    "build:web-control": "vite build --config ../config/web-control/vite.config.mjs",
+    "dev:recording": "vite --config ../config/recording/vite.config.mjs",
+    "build:recording": "vite build --config ../config/recording/vite.config.mjs",
+    "dev:training": "vite --config ../config/training/vite.config.mjs",
+    "build:training": "vite build --config ../config/training/vite.config.mjs",
+    "preview": "vitepress preview docs",
+    "test:e2e": "playwright test --config ../config/website/playwright.config.mjs",
+    "test:web-control": "playwright test --config ../config/web-control/playwright.config.mjs",
+    "test:training": "playwright test --config ../config/training/playwright.config.mjs"
+  },
+  "dependencies": {
+    "gridstack": "^13.3.0",
+    "marked": "16.4.2",
+    "three": "0.185.1",
+    "uplot": "^1.6.32",
+    "urdf-loader": "0.13.1",
+    "vue": "3.5.44"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.1",
+    "mermaid": "^11.17.2",
+    "vitepress": "1.6.4",
+    "vitepress-plugin-mermaid": "^2.0.17",
+    "yaml": "^2.8.1"
+  },
+  "overrides": {
+    "source-map-js": "^1.2.2"
+  }
+}

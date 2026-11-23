@@ -1,0 +1,98 @@
+---
+title: 完整 TF 树
+description: RM65 描述包中 world、机械臂连杆和相机坐标系的连接关系。
+---
+
+# 完整 TF 树
+
+::: tip 交互版
+首页的[三臂场景与 TF](/)可以悬停任一坐标系：高亮它和它的父坐标系，并显示连接的关节、旋转轴、限位和相对父级的位姿；数据直接读自加载的 URDF。
+:::
+
+每个 URDF 都显式声明 `world`，并通过固定关节连接 `base_link`。这让 RViz 的 Fixed Frame 可以稳定设置为 `world`，也避免独立查看模型时出现多个不相连的 TF 子树。
+
+## 交互浏览
+
+悬停左侧的坐标系（或右侧三维视图里的连杆）：橙色是子坐标系，青色是它的父坐标系，橙色箭头从父指向子。
+
+<TfExplorer />
+
+## RM65-B 主链
+
+<div class="tf-tree-doc">
+  <div class="tf-rail" aria-label="RM65 主 TF 树">
+    <span class="tf-node root">world</span><span class="tf-arrow"></span>
+    <span class="tf-node">base_link</span><span class="tf-arrow"></span>
+    <span class="tf-node">link_1</span><span class="tf-arrow"></span>
+    <span class="tf-node">link_2</span><span class="tf-arrow"></span>
+    <span class="tf-node">link_3</span><span class="tf-arrow"></span>
+    <span class="tf-node">link_4</span><span class="tf-arrow"></span>
+    <span class="tf-node">link_5</span><span class="tf-arrow"></span>
+    <span class="tf-node">link_6</span>
+  </div>
+</div>
+
+| 父坐标系 | 关节 | 类型 | 子坐标系 |
+| --- | --- | --- | --- |
+| `world` | `world_to_base_link` | fixed | `base_link` |
+| `base_link` | `joint_1` | revolute | `link_1` |
+| `link_1` | `joint_2` | revolute | `link_2` |
+| `link_2` | `joint_3` | revolute | `link_3` |
+| `link_3` | `joint_4` | revolute | `link_4` |
+| `link_4` | `joint_5` | revolute | `link_5` |
+| `link_5` | `joint_6` | revolute | `link_6` |
+
+## 相机分支
+
+带 `-V` 后缀的型号继续从末端连接相机坐标系：
+
+| 父坐标系 | 关节 | 类型 | 子坐标系 |
+| --- | --- | --- | --- |
+| `link_6` | `camera_rojoint` | fixed | `camera_rolink` |
+| `camera_rolink` | `camera_joint` | fixed | `camera_link` |
+
+这两个关节是固定关节，不需要 `joint_state_publisher_gui` 提供状态。
+
+## 运行时检查
+
+检查根坐标系到末端的变换：
+
+```bash
+ros2 run tf2_ros tf2_echo world link_6
+```
+
+带相机的型号可以检查：
+
+```bash
+ros2 run tf2_ros tf2_echo world camera_link
+```
+
+安装 `tf2_tools` 后可以生成整棵树的报告：
+
+```bash
+ros2 run tf2_tools view_frames
+```
+
+RViz 配置已经将 Fixed Frame 设置为 `world`，并启用了 TF 与 RobotModel 显示项。
+
+## 三机械臂 TF 树
+
+三臂模式给每个 URDF frame 添加机器人前缀，然后用配置中的静态变换接入同一个全局 `world`：
+
+```text
+world
+├── l/world -> l/base_link -> l/link_1 -> ... -> l/link_6
+├── m/world -> m/base_link -> m/link_1 -> ... -> m/link_6
+└── r/world -> r/base_link -> r/link_1 -> ... -> r/link_6
+```
+
+ROS 节点和 topic 使用 `/l`、`/m`、`/r` 命名空间；TF frame 使用 `l/`、`m/`、
+`r/` 前缀。这两个隔离层分别避免节点/topic 重名和 TF frame 重名。
+
+检查三台机械臂末端：
+
+```bash
+ros2 run tf2_ros tf2_echo world l/link_6
+ros2 run tf2_ros tf2_echo world m/link_6
+ros2 run tf2_ros tf2_echo world r/link_6
+```

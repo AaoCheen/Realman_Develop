@@ -1,0 +1,212 @@
+# Policy task run by the behavior tree (config/behavior-trees/control.xml, policy branch): how many cycles and attempts,
+# and every threshold PolicyRun and GripperReady judge an attempt by. Design:
+# docs/superpowers/specs/2026-10-14-policy-task-in-bt-design.md. Loaded by control_router.launch.py as parameters of the
+# executor; policy_task_params.cpp declares exactly these keys, and test_policy_task_config_file.py fails if the file and
+# the loader disagree (ROS would otherwise ignore a mistyped key and use the default).
+#
+# Change a threshold only together with the data it came from. Edits need a restart of ./rm65 bt.
+realman_bt_executor:
+  ros__parameters:
+    policy_task:
+      # Cycles that have to succeed, and failed attempts allowed within one cycle (the first try counts). -1 = no limit.
+      # control_pick.xml: an attempt starts from the start pose and holds up to pick_cycle.regrasp_attempts policy runs.
+      cycles: 1
+      attempts: 3
+      # Policy-server timeouts, retried on a budget of their own (they do not use up `attempts`): the bridge paused
+      # itself after failure_pause_threshold inference requests in a row timed out (policy_bridge.yaml
+      # infer_timeout_s), its stats went silent for stats_stale_sec, it was not ready within service_wait_sec, or
+      # /policy/activate did not answer. Each retry first waits backoff_sec with the bridge stopped, then opens the
+      # gripper and goes back to the start pose like any retry. 20 s covers the ~26 s JIT compile of the first inference
+      # after a serve restart (the bridge needs ~8 s of timeouts to pause) and a short Wi-Fi collapse (2026-10-14/16).
+      # attempts: timeouts allowed per cycle, the first counts; -1 = no limit. Reaching it ends the task (FAILED).
+      timeout_retry:
+        attempts: 3
+        backoff_sec: 20.0
+      # The arm the policy drives. l since 2026-11-19: SJDrealman's data and model are left-arm only. The place task's
+      # release / lift wrong-side J1 limits below were measured on the right arm (realman_ts) and do not fit l.
+      arm: l
+      # auto: PolicyRun calls /policy/activate itself once the preflight checks pass, so selecting the policy mode is
+      #   enough to start a run (the arms first go to the start pose). operator: PolicyRun only waits until a person
+      #   has called /policy/activate and supervises from there; every attempt waits again.
+      activation: auto
+      # Must match policy_bridge.yaml downlink.command_namespace (checked by a test).
+      command_namespace: /pi05_policy
+      # Must match policy_bridge.yaml prompt.topic (checked by a test). PolicyRun publishes its task's prompt here and
+      # starts only once /policy/stats reports that the bridge uses it.
+      prompt_topic: /policy/prompt
+
+      # The tasks the served policy was trained on; the BT's PolicyRun picks one with its `task` port. A prompt must be
+      # the training view's task text VERBATIM (meta/tasks.parquet; for m_multitask_b16_2gpu also contract.json
+      # `prompts`): one character off and the model is out of distribution without any error. completion is how a
+      # successful attempt ends: release_over_bin (the `release` block below), lift_and_hold (the `lift` block) or
+      # grasp_check (the `grasp_check` block; control_pick.xml then lifts and carries the object itself).
+      # ROS parameters cannot list keys, so every task is named in task_names first.
+      task_names: [place, pick]
+      tasks:
+        place:
+          prompt: "pick up the power adapter and put it in the blue bin"
+          completion: release_over_bin
+        # The SJD left-arm model (openpi pi05_realman_sjd_left_v1_action_only, prompt_from_task) was trained on the
+        # view sjd_left_v1_view, whose meta/tasks.parquet holds this text for its one task pick_and_place (checked
+        # 2026-11-21; the 11-19 value "pick_and_place" was the task NAME, not its text). grasp_check ends the attempt
+        # at the grasp; the right-arm pick-only models used "pick up the power adapter".
+        pick:
+          prompt: "pick up the power adapter and put it in the blue bin"
+          completion: grasp_check
+      gripper_for_arm:
+        l: gripper_left
+        m: gripper_mid
+        r: gripper_right
+
+      # RealMan degrees, of the driven arm. Left arm (2026-11-19): p1 and p99 of every frame of SJDrealman's 87 left
+      # demonstrations (46516 frames, all starting at the Pika start pose J1 12.17), widened by 10 degrees each side;
+      # J5 is floored at 3.5 (p1 1.3 - 10 would cross the wrist singularity at 0), as for the right arm. Checked only
+      # while PolicyRun runs, so the release turn to J1 79.455 is not judged against it.
+      # Right arm before (130 realman_ts demos 2026-10-14, J5 3.5 since 10-23): lo [-73.4, 5.0, -16.2, -28.4, 3.5, -125.1],
+      # hi [40.1, 107.0, 124.3, 70.8, 108.2, 49.0].
+      joint_envelope_deg:
+        lo: [-37.5, -0.6, -27.0, -168.1, 3.5, -98.5]
+        hi: [26.1, 107.1, 138.1, 39.6, 126.9, 136.8]
+      # Between joint_states samples at least ~0.1 s apart. The runs on 2026-10-14 never exceeded this.
+      max_joint_speed_dps: 50.0
+      # The two arms that are not driven must stay where they were when the attempt started.
+      lm_drift_limit_deg: 1.0
+      # No joint_states from an arm for this long, or no /policy/stats for stats_stale_sec (published at 1 Hz).
+      joint_state_stale_sec: 1.0
+      stats_stale_sec: 5.0
+      # How long the preflight waits for the four stop/start services and the data before it gives up (a fault).
+      service_wait_sec: 10.0
+      # Reply timeout for one service call; the stop sequence continues without the reply after this.
+      service_call_timeout_sec: 2.0
+      # No success (release over the bin, or lift-and-hold) within this long is a retryable timeout. Demonstrations last
+      # 11 to 27 s (median 18 s) for place; the 2026-10-19 pick runs lifted within 11-14 s.
+      max_attempt_sec: 45.0
+      # Retryable stall: the gripper is closed and the commanded velocity stays below both limits for sec.
+      # 2026-10-14 cycle 2 held an adapter and then commanded ~0.001 m/s for 30 s.
+      stall:
+        cmd_lin_mps_below: 0.01
+        cmd_ang_radps_below: 0.04
+        sec: 8.0
+      # Retryable overcurrent (pressing on the table): a joint of the supervised arm draws more than limits_ma (|mA|,
+      # J1..J6, from the driver's /<arm>/joint_currents) in every reading for sustain_sec. The attempt stops like any
+      # other and the retry opens the gripper, goes back to the start pose and grasps again; it uses up one of
+      # `attempts`. Measured on the 67 traced attempts of 2026-10-20..23 (i1_ma..i6_ma, 0.5 s sustained): normal
+      # approaches, grasps and lifts stay below 1.6 / 3.7 / 4.5 / 2.4 / 2.7 / 1.1 A; pressing saturates J2 at ~10 A
+      # (J3 up to 16, J4/J5 at 9) for seconds, and on 2026-10-23 16:28 and 16:42 the controller tripped and the driver
+      # lost the arm ~6 s after J2 passed 7 A. These limits stop 9 of those attempts 0.5 s into the push and none of
+      # the normal ones. enabled: false keeps recording the currents without stopping on them.
+      current_guard:
+        enabled: true
+        limits_ma: [4000, 7000, 8000, 6000, 7500, 3000]
+        sustain_sec: 0.5
+
+      # Release = the policy's gripper command goes above open_above after it has been below closed_below for
+      # min_closed_sec in total, while the arm is over the bin (joint_index below joint_below_deg; J1 is far negative
+      # on the bin side). The position test keeps the policy's retry-opens over the mat from ending an attempt.
+      release:
+        open_above: 0.8
+        closed_below: 0.2
+        min_closed_sec: 3.0
+        joint_index: 0
+        joint_below_deg: -35.0
+        # The attempt is supervised for this long after the release command so the gripper really opens.
+        settle_sec: 1.0
+      # lift_and_hold tasks. After the policy first closes the gripper (command below release.closed_below), the
+      # attempt succeeds once the jaws hold the object (position below verdict.empty_position_min with torque), the
+      # gripper has been commanded closed for min_closed_sec, joint joint_index has moved joint_delta_deg from its value
+      # at the close (negative = decreasing; J2 decreases as the arm lifts), and that lasts hold_sec. The gripper stays
+      # closed on the object. Dropped (retryable): held, then the position reached empty_position_min while still
+      # commanded closed. Wrong task (a fault, not retried): joint wrong_side_joint_index below wrong_side_below_deg
+      # after the close, i.e. the arm heads for the bin under the pick prompt. Measured 2026-10-19: pick runs lifted J2
+      # by 11-40 deg and kept J1 near +8; place runs turn J1 to about -60.
+      lift:
+        min_closed_sec: 3.0
+        joint_index: 1
+        joint_delta_deg: -10.0
+        hold_sec: 2.0
+        wrong_side_joint_index: 0
+        wrong_side_below_deg: -25.0
+      # grasp_check tasks: judged as soon as the policy closes the gripper (command below release.closed_below, sent
+      # during this attempt). Held = torque with the position below verdict.empty_position_min, unbroken and within
+      # steady_position_range for confirm_sec: success, the policy stops and the tree carries the object. Missed
+      # (retryable) = the position reaches empty_position_min (jaws met), or no hold within timeout_sec of the close.
+      # The policy opening again first cancels the check. While the tree carries the object (WhileGraspHeld in
+      # control_pick.xml), carry_lost_sec of positions at or above empty_position_min is a drop: the carry stops and
+      # the attempt is retried. Measured on the 86 closes in the 2026-10-20..11-01 pick traces that stayed closed 3 s:
+      # held ones settle 0.6-2.9 s after the close (46 of 47 pass 0.8 s / 200, all within 4.8 s); empty ones reach
+      # 7800 in 1.3-4.8 s and show torque blips under 1 s while the jaws travel. A recorded attempt (/recording/attempt)
+      # ends when the carry does, not at the close: carry_record_sec is added to the recorder's deadline for it (the
+      # carry's own timeouts: 2 s lift + 60 s MoveJ + 60 s turn).
+      grasp_check:
+        confirm_sec: 0.8
+        steady_position_range: 200.0
+        timeout_sec: 6.0
+        carry_lost_sec: 0.3
+        carry_record_sec: 125.0
+      # Grasp verdict: the median gripper position over the last window_sec of the closed phase, with torque_reached
+      # seen, means the object was held. Measured 2026-10-14: held ~5700-5800 with torque, empty 8380-8480 without.
+      verdict:
+        window_sec: 3.0
+        empty_position_min: 7800.0
+      # GripperReady: position (device units, open ~50, closed 8500) at or below this counts as open.
+      gripper_ready:
+        open_position_max: 500.0
+        timeout_sec: 20.0
+        position_stale_sec: 2.0
+      # One CSV per attempt: the right arm's joints, the other arms' drift, the gripper and the commanded speeds, every
+      # period_sec, with result / grasp / seconds / reason at the end. It is the record of WHY an attempt ended: the
+      # behavior tree's own event list only keeps the last 200 events and the Web page's polling fills it. The directory is
+      # the host's ~/realman_pi/logs/policy-attempts (the bringup container mounts logs/ read-write). A trace that cannot
+      # be written never affects the attempt.
+      trace:
+        enabled: true
+        dir: /opt/rm65_ws/logs/policy-attempts
+        period_sec: 0.1
+      # Pick-and-clear cycle of config/behavior-trees/control_pick.xml (the pick task, repeated until the table is
+      # clear). After an attempt lifts the object, the driven arm (`arm`) goes to lift_joint_degrees, turns joint release_joint
+      # (1-based: 1 = J1) to release_joint_deg, opens the gripper there and WhiteObjectsRemain checks the table.
+      # lift_joint_degrees is the right arm's start pose (pika_config.yaml) until a dedicated lift pose is measured
+      # (decision 2026-10-20). Velocities are the XML's (10%). The turn from the lift pose to J1 -135 (clockwise seen from
+      # above) was run on the robot at 5% without an object on 2026-10-20 and the operator saw no obstacle on the path.
+      # 2026-10-30: release at J1 -163 instead (user decision), turning further the same way; -135..-163 not yet path-checked.
+      # regrasp_attempts: policy runs within one attempt (the first counts; -1 = no limit). After a miss (or another
+      # retryable stop of the policy) the gripper opens, the arm lifts ~4 cm and the policy continues from there; when
+      # they are used up, or the object drops while carried, the attempt fails and the next one starts from the start
+      # pose. 2026-11-01 (user decision): 3 attempts x 3 regrasps.
+      pick_cycle:
+        # Left arm (2026-11-19): the release pose was taught on SJDrealman as [79.455, 25.257, 73.104, -7.472, 80.312,
+        # 14.449]. The lift pose is that pose with the start pose's J1 (12.172), so the MoveJ only adjusts the wrist
+        # and the J1 turn ends exactly on the taught pose. 12.172 -> 79.455 is the short way round (+67.3 deg,
+        # counterclockwise seen from above); MoveJ interpolates in joint space, so it never takes the long way.
+        # Right arm before: lift = its start pose, J1 -163 (clockwise).
+        lift_joint_degrees: [12.172, 25.257, 73.104, -7.472, 80.312, 14.449]
+        release_joint: 1
+        release_joint_deg: 79.455
+        regrasp_attempts: 3
+      # WhiteObjectsRemain: grey-ish (low-chroma) blobs on the mat in the global D435 image mean objects are left.
+      # roi_xywh is the mat in the 640x480 image (pixels: x, y, width, height). A pixel counts when its smallest RGB
+      # channel is at least min_channel and max-min of its channels is at most max_chroma; it is kept only if its whole
+      # erode_px x erode_px square counts, which removes thin cables. min_pixels such pixels = an object is left.
+      # exclude_xywh (x, y, width, height per rectangle, flattened) is never counted; an object lying inside it is not seen.
+      # SJDrealman 2026-11-19 (one live frame, left arm parked at the release pose, out of the frame): the objects are
+      # BLACK power adapters on a saturated teal mat, so min_channel is 0 and only chroma separates them: mat chroma
+      # ~79 (no ROI pixel at or below 45), adapter ~8. ROI = inside the mat edges (mat ~x 150-568, y 95-387, slightly
+      # tilted). The exclusion is the right arm's gripper, which sits at its start pose over the mat's right edge
+      # (x 470-570, y 220-290) during the check; without it the empty mat counts 150-480. Result at max_chroma 35:
+      # empty mat 0, one adapter 827 (754-890 for 30-40), its cable 0. White objects are found too.
+      # realman_ts before (white adapters, dark green mat, glare): roi [235, 125, 250, 230], exclude [392, 170, 75, 185],
+      # min_channel 90, max_chroma 40. The image used is the first one received settle_sec after the check started
+      # (the arm has parked by then); none within timeout_sec more fails the task. Re-measure after moving the camera.
+      object_detection:
+        image_topic: /camera_global/d435/color/image_raw
+        roi_xywh: [178, 122, 372, 236]
+        exclude_xywh: [462, 208, 90, 92]
+        min_channel: 0
+        max_chroma: 35
+        erode_px: 9
+        min_pixels: 150
+        settle_sec: 1.0
+        timeout_sec: 5.0
+      # After the stop calls, wait this long for the router to release its velocity session (its input_timeout_ms is
+      # 500) so the next ThreeArmMoveJ does not fight it.
+      router_release_sec: 1.5

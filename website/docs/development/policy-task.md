@@ -1,0 +1,405 @@
+---
+title: Policy 任务（行为树监督）
+description: 行为树中的 policy 任务：回位、激活、监督、判定、重试与停止，策略服务超时重试，以及按 prompt 区分的任务、阈值和轨迹记录。
+---
+
+# Policy 任务（行为树监督）
+
+策略已能在真机上完成抓取放置，但"回位、激活、监控、判定、重试、停止"过去全靠行为树之外的临时脚本完成。现在这些步骤都由行为树的 policy 分支负责：选择 `policy` 模式后，行为树会把三臂送到训练起点、激活桥接、监督每一次尝试，并按失败类型决定重试还是停止。控制权只归执行器一方所有：用户在 Web 中切换模式时，整个任务会经 `onHalted()` 干净地收尾。
+
+设计依据与评审记录见 [`2026-10-14-policy-task-in-bt-design.md`](https://github.com/QingTianRobot/realman_pi/blob/main/docs/superpowers/specs/2026-10-14-policy-task-in-bt-design.md)。路由部分（会话转发、限速、漂移保护）没有变化，见 [VLA 策略桥接节点](./policy-bridge)。
+
+## 树的结构
+
+```xml
+<Sequence name="policy_entry">
+  <ThreeArmMoveJ name="policy_start_pose" .../>          <!-- 回位成功后才发布 ACTIVE/policy -->
+  <ActivateInputMode mode="policy"/>
+  <Fallback name="policy_task">
+    <Sequence name="policy_cycles_ok">
+      <Repeat num_cycles="{policy_cycles}">
+        <RetryUnlessFault num_attempts="{policy_attempts}"
+                          timeout_attempts="{policy_timeout_attempts}"
+                          timeout_backoff_sec="{policy_timeout_backoff_sec}">
+          <Sequence name="policy_attempt">
+            <GripperReady arm_id="r" dry_run="{dry_run}"/>
+            <ThreeArmMoveJ name="policy_rehome" .../>
+            <PolicyRun arm_id="r" task="place" dry_run="{dry_run}"/>
+          </Sequence>
+        </RetryUnlessFault>
+      </Repeat>
+      <PolicyInputStub/>                                  <!-- 全部周期完成：保持 RUNNING，桥接已停止 -->
+    </Sequence>
+    <FailInputMode reason="{policy_failure_reason}"/>     <!-- 故障或次数耗尽：进入 FAILED，路由切到 none -->
+  </Fallback>
+</Sequence>
+```
+
+- `Repeat` 统计成功的周期数，`RetryUnlessFault` 统计一个周期内失败的尝试次数。每次重试前都会 `halt()` 整个 `policy_attempt`，因此每次重试都从"张开夹爪、回位"重新开始。
+- 策略服务超时（`policy_timeout`）另算一份次数 `{policy_timeout_attempts}`，不占用 `{policy_attempts}`，重试前先等待 `{policy_timeout_backoff_sec}`，详见 [策略服务超时重试](#策略服务超时重试)。
+- 如需逐拍查看这棵子树的执行过程（重试、故障、周期计数），可以使用 [行为树节点参考](./behavior-tree-nodes#逐拍查看-policy-任务) 中的模拟。
+- 周期数、尝试次数和全部阈值都在 [`config/ros/policy_task.yaml`](https://github.com/QingTianRobot/realman_pi/blob/main/config/ros/policy_task.yaml) 中，XML 里只有 `{policy_cycles}` 这类黑板重映射。
+
+## 任务与 prompt
+
+多任务模型（`m_multitask_b16_2gpu`）通过 prompt 区分任务：同一个模型，收到放置的 prompt 就把物体放进收纳盒，收到抓起的 prompt 就抓起后保持。行为树并不为每个 prompt 单独编写叶节点，而是为 `PolicyRun` 提供一个 `task` 端口，指向 `policy_task.yaml` 中 `tasks` 下的某一项。每一项包含两个字段：
+
+| 字段 | 作用 |
+| --- | --- |
+| `prompt` | 发送给桥接的任务文本，必须与训练数据视图中的任务文本逐字一致；哪怕相差一个字符，模型的输入也会偏离训练分布 |
+| `completion` | 一次尝试的成功判定方式：`release_over_bin`（在收纳盒一侧放手，且曾夹住物体）、`lift_and_hold`（抬起后仍夹住物体）或 `grasp_check`（夹爪一闭合就判定是否夹牢） |
+
+目前有两项：`place`（`pick up the power adapter and put it in the blue bin`，`release_over_bin`）和 `pick`（`pick up the power adapter`，`grasp_check`；2026-11-01 前为 `lift_and_hold`）。生产树 `control.xml` 的 policy 分支使用 `task="place"`。纯抓起任务用的是 `control_pick.xml`（见下文[抓取清台树](#抓取清台树-control-pick-xml)）：抓起成功后由树把物体送到放置位置再松开，然后用全局相机判断桌上还有没有物体。
+
+三种完成条件的阈值分别位于 `release`、`lift` 和 `grasp_check` 配置块中，由使用同一完成条件的所有任务共用。
+
+`grasp_check` 在策略闭合夹爪（本次尝试中收到的夹爪指令低于 `release.closed_below`）的那一刻开始判定，不等策略抬起：
+
+- **夹牢**（`grasp_held`，成功）：夹爪有力矩（`torque_reached`）且位置低于 `verdict.empty_position_min`，并且连续 `grasp_check.confirm_sec`（0.8 s）不中断、位置波动不超过 `grasp_check.steady_position_range`（200）。尝试随即结束，策略停止，夹爪保持闭合，由树接手抬起和搬运（见[抓取清台树](#抓取清台树-control-pick-xml)）。
+- **抓空**（`grasp_missed`，可重试）：位置达到 `verdict.empty_position_min`（夹爪合到底），或闭合后 `grasp_check.timeout_sec`（6 s）内没有夹牢。立即停止策略，张开夹爪、回位后重新开始，不再等策略自己补抓。
+- 判定结束前策略又张开夹爪，本次判定作废，等它下一次闭合重新计时。
+- 只认本次尝试中收到的夹爪指令：上一次尝试最后的闭合指令会一直是最新值，直到策略重新发布（2026-11-01 每条轨迹开头都能看到），不能把它当作闭合。
+
+阈值来自 2026-10-20 到 11-01 的 pick 轨迹中闭合后保持 3 s 以上的 86 次闭合：47 次夹住的，夹爪在闭合后 0.6–2.9 s 稳定，按 0.8 s / 200 的条件有 46 次能确认（最晚 4.8 s）；39 次抓空的，位置在 1.3–4.8 s 内达到 7800，合爪过程中常出现不到 1 s 的力矩脉冲（例如 11-01 06:32:37 在 5085 处闪了一下力矩，随后合到 8244），所以力矩必须持续且位置稳定才算夹牢。
+
+`lift_and_hold` 从策略第一次闭合夹爪（夹爪指令低于 `release.closed_below`）时开始判定：
+
+- **成功**（`lifted_held`）：夹爪夹住了物体（位置低于 `verdict.empty_position_min`，且出现过力矩），累计闭合时间不少于 `lift.min_closed_sec`，并且 `lift.joint_index` 指定的关节（J2）相对闭合时刻移动了 `lift.joint_delta_deg`（负值表示角度减小；RM65 抬起时 J2 减小）。上述条件持续 `lift.hold_sec` 即判定成功。
+- **掉落**（`dropped`，可重试）：曾夹住物体，但之后位置回到 `verdict.empty_position_min` 以上，而策略仍在指令夹爪闭合。
+- **执行了错误的任务**（`wrong_task`，故障）：闭合之后，`lift.wrong_side_joint_index` 指定的关节（J1）低于 `lift.wrong_side_below_deg`，即手臂转向了收纳盒一侧，**且夹爪里有东西**（位置低于 `verdict.empty_position_min`），或者读不到夹爪位置。这说明策略在 pick 的 prompt 下仍把物体往收纳盒搬，没有按 prompt 执行抓起，重试也无济于事，因此不会重试。
+- **抓空后转向收纳盒**（`wrong_side_empty`，可重试）：同样越过 J1 的限制，但夹爪已合到底（位置不低于 `verdict.empty_position_min`），什么也没夹住。2026-10-20 真机上出现过：策略抓空后抬起并转向收纳盒。此时没有物体被带走，下一次尝试会张开夹爪、回位后重新开始。
+
+## 抓取清台树（control_pick.xml）
+
+只验证一次左臂模型抓取时，使用独立的 `control_left_pick_once.xml`，不使用清台树。
+先运行 `REALMAN_BT_DRY_RUN=true ./rm65 bt control_left_pick_once` 并选择 policy 验证流程。
+停止预演、确认左臂到保存起始位的路径无障碍且急停可达后，才改为 `REALMAN_BT_DRY_RUN=false`。
+选 policy 会实际回位、打开左夹爪并监督一次模型抓取；没有搬运、释放或自动重试。
+
+`config/behavior-trees/control_pick.xml` 是 `control.xml` 的副本，除 policy 分支外，其余分支逐字相同（有测试检查）。它的 policy 分支用纯抓起策略把桌上的电源适配器一个个拿走，直到桌面清空：
+
+```xml
+<Fallback name="pick_task">
+  <Sequence name="pick_task_ok">
+    <SetBool key="pick_table_clear" value="false"/>
+    <Fallback name="pick_until_clear">
+      <Repeat num_cycles="-1">
+        <Sequence name="pick_cycle">
+          <RetryUnlessFault ...>  <!-- 大重试：{policy_attempts} 次，每次从起始位姿开始 -->
+            <Sequence name="pick_attempt">
+              <GripperReady .../> <ThreeArmMoveJ name="policy_rehome" .../>
+              <SetBool key="pick_regrasp" value="false"/>
+              <!-- 小重试：{pick_regrasp_attempts} 次，从当前位置继续 -->
+              <RetryUnlessFault name="pick_regrasps" num_attempts="{pick_regrasp_attempts}"
+                                timeouts_to_parent="true">
+                <Sequence name="pick_try">
+                  <Fallback name="pick_regrasp_prepare">
+                    <CheckBool key="pick_regrasp" expected="false"/>  <!-- 第一次跳过 -->
+                    <Sequence name="pick_regrasp_back_off">
+                      <GripperReady name="pick_regrasp_open" arm_id="r" .../>
+                      <CartesianVelocityForDuration name="pick_regrasp_lift" reference="work/pikabase"
+                                                    linear_velocity_mps="0,0,0.02" duration_sec="2.0" .../>
+                    </Sequence>
+                  </Fallback>
+                  <SetBool key="pick_regrasp" value="true"/>
+                  <PolicyRun arm_id="r" task="pick" .../>  <!-- grasp_check：闭合即判定 -->
+                </Sequence>
+              </RetryUnlessFault>
+              <WhileGraspHeld name="pick_carry" arm_id="r" ...>
+                <Sequence name="pick_carry_to_release">
+                  <CartesianVelocityForDuration name="pick_lift_up" reference="work/pikabase"
+                                                linear_velocity_mps="0,0,0.03" duration_sec="2.0" .../>
+                  <MoveJ name="pick_lift_pose" arm_id="r" joint_degrees="{pick_lift_joint_degrees}" .../>
+                  <MoveJointTo name="pick_turn_to_release" arm_id="r" joint="{pick_release_joint}"
+                               target_degrees="{pick_release_joint_deg}" .../>
+                </Sequence>
+              </WhileGraspHeld>
+            </Sequence>
+          </RetryUnlessFault>
+          <GripperReady name="pick_release" arm_id="r" .../>
+          <WhiteObjectsRemain name="objects_remain" table_clear="{pick_table_clear}" .../>
+        </Sequence>
+      </Repeat>
+      <CheckBool key="pick_table_clear" expected="true"/>
+    </Fallback>
+    <ThreeArmMoveJ name="pick_done_home" .../>  <!-- 清空后三臂回起始位姿 -->
+    <PolicyInputStub/>
+  </Sequence>
+  <FailInputMode reason="{policy_failure_reason}"/>
+</Fallback>
+```
+
+2026-11-19 起抓取清台由**左臂（l）**执行（`policy_task.arm: l`，树中各节点 `arm_id="l"`）：SJDrealman 的示教数据和模型只用左臂。策略桥接同步改为左臂腕部相机 `/camera_left/color/image_raw`、`active_side` 默认 `left`，pick 的 prompt 为左臂模型训练视图 `sjd_left_v1_view` 的任务文本 `pick up the power adapter and put it in the blue bin`（`meta/tasks.parquet`；11-19 误写成任务名 `pick_and_place`，模型从没见过这个 prompt，2026-11-21 改正）。这个模型只有一个训练 prompt，`pick` 和 `place` 因此共用同一段文本，只是结束方式不同（`grasp_check` / `release_over_bin`）；执行器只拒绝 prompt 和结束方式都相同的两个任务；关节包络取自 SJD 87 条左臂示教。此前在 realman_ts 上由右臂执行（J1 转到 -163° 放置），下文中的历史记录保留了右臂的数值。
+
+每个周期依次执行：
+
+1. **抓取**：`task="pick"`，以 `grasp_check` 判定：策略一闭合夹爪就判断有没有夹牢。夹牢则策略停下，夹爪保持闭合，进入搬运。没有成功时分两级重试（2026-11-01 起，原来只有一级，每次都回位）：
+   - **小重试**（内层 `RetryUnlessFault pick_regrasps`，`pick_cycle.regrasp_attempts` 次，含第一次，默认 3）：抓空，或策略因其他可重试的原因停下（电流过大、停滞、超过 `max_attempt_sec`），先张开夹爪，再在 `work/pikabase` 中以 0.02 m/s 竖直抬起 2 s（含加减速约 4 cm，2026-11-01 由约 2 cm 加高），然后不回位，从当前位置继续运行策略。黑板键 `pick_regrasp` 记录这是不是本次大重试中的第一次策略运行：第一次直接从起始位姿开始，不张开、不抬起。
+   - **大重试**（外层 `RetryUnlessFault`，`attempts` 次，默认 3）：小重试用完，或搬运途中物体掉落（见第 3 步），张开夹爪、三臂回到起始位姿，再开始新一轮小重试。因此一个周期最多运行 3 × 3 = 9 次策略。
+   - 策略服务超时不在原地重试：内层设置了 `timeouts_to_parent="true"`，带着 `policy_timeout` 立即交给外层，由外层按 `timeout_retry` 等待、回位并单独计数，与原来的行为相同。故障（`policy_fault`）使两层都立即放弃。
+2. **竖直抬起**：`CartesianVelocityForDuration` 在恒等工作坐标系 `work/pikabase`（即左臂竖直安装的基座系，+Z 向上）中以 0.03 m/s 向上运动 2 s（含加减速约 5.5 cm）。策略停下时夹爪还贴着桌面，先竖直离开桌面，后面的关节空间 MoveJ 就不会拖着物体扫过垫子。
+3. **搬运全程监测**：第 2–4 步都包在 `WhileGraspHeld` 里，并且和抓取一起位于 `RetryUnlessFault` 之内。每个 tick 先读 `/gripper_left/position`：位置在 `verdict.empty_position_min` 以上持续 `grasp_check.carry_lost_sec`（0.3 s），就是物体掉了，立即 halt 正在执行的运动并返回可重试的失败，外层 `RetryUnlessFault`（大重试）张开夹爪、回位后重新运行策略。掉落消耗一次 `attempts`（此时手臂已离开桌面，不做小重试）。搬运中的运动失败或超过 `gripper_ready.position_stale_sec` 读不到夹爪位置，由 `WhileGraspHeld` 置位 `policy_fault`，不重试，与这些运动放在重试外面时的行为一致。
+4. **抬升到固定位姿**：左臂 `MoveJ` 到 `pick_cycle.lift_joint_degrees` = `[12.172, 25.257, 73.104, -7.472, 80.312, 14.449]`，即放置位姿换成起始位姿的 J1，只调整手腕，下一步只转 J1 就正好到放置位姿。改位姿只改配置，不用改 XML。
+5. **转到放置侧**：`MoveJointTo` 只把 J1（`pick_cycle.release_joint`）从 12.172° 转到 `pick_cycle.release_joint_deg`（79.455°），以 20% 速度转动，其余关节保持不动。放置位姿 `[79.455, 25.257, 73.104, -7.472, 80.312, 14.449]` 于 2026-11-19 在 SJDrealman 上示教。按最小角度转过去：J1 增大约 67.3°，从上往下看是逆时针；MoveJ 在关节空间插值，不会绕远路。这条路径还没有在真机上空载确认过。
+6. **松开**：`GripperReady` 张开左夹爪，物体落在放置侧。
+7. **检测**：`WhiteObjectsRemain` 读一帧全局相机（D435）图像，判断垫子上是否还有物体（低饱和度色块：SJD 上是黑色适配器，realman_ts 上是白色适配器）。有物体就返回 `SUCCESS`，`Repeat` 开始下一个周期；没有物体就写入 `pick_table_clear=true` 并返回失败，以此结束 `Repeat`。
+
+`Repeat` 结束后由 `CheckBool` 判断结束原因：如果是桌面已清空，先由 `pick_done_home` 让三臂回到起始位姿，再停在 `PolicyInputStub`（policy 模式空闲，桥接已停止）。回位这一步不能省：进入 policy 模式的第一步回位受输入模式切换超时（`behavior_tree.yaml` 的 `switch_timeout_ms`，5 s）限制，如果手臂停在放置侧（右臂 -135° 时回位约需 8 s），会超时并退回 none（2026-10-20 真机上出现过）。其他原因（尝试次数用完、故障、某个 MoveJ 失败、相机没有图像）都不会写入 `pick_table_clear`，于是经 `FailInputMode` 进入 `FAILED`；这条路径不会自动回位，再次进入前如果左臂不在起始位姿附近，需要先手动回位（见下文操作流程）。抬起、抬升、转动这几步的运动失败由 `WhileGraspHeld` 写入 `policy_failure_reason`（`carrying the object failed in pick_carry_to_release: ...`），`FAILED` 的说明就是它。
+
+### 桌面物体检测（WhiteObjectsRemain）
+
+检测在 `object_detection.roi_xywh` 所框出的绿色垫子区域内进行，桌外白色的地面和机械臂不计入。`exclude_xywh` 中的矩形（每 4 个数为一组：x、y、宽、高）内的像素一律不算白色，用来去掉顶灯在光面垫子上的反光，因为反光和适配器一样白，亮度上无法区分。落在排除区里的物体看不到，循环可能会在它还没被抓走时就结束。
+
+- 一个像素的 RGB 三个通道中，最小值不低于 `min_channel`、最大值与最小值之差不超过 `max_chroma`，就算作白色。
+- 做一次 `erode_px`×`erode_px` 的方形腐蚀：只有整个方块都是白色的像素才保留。适配器的白色线缆只有几个像素宽，会被这一步去掉。
+- 保留下来的像素数不少于 `min_pixels`，就认为桌上还有物体。
+
+图像必须在检测开始 `settle_sec` 之后收到，以确保拍到的是手臂已停在放置侧时的画面；`timeout_sec` 内没有图像则判为失败。
+
+realman_ts 标定（2026-10-20，白色适配器、深绿色光面垫子；当时取 `roi_xywh` `[235, 125, 250, 230]`、`min_channel` 90、`max_chroma` 40）：
+
+- 录制画面中适配器每个通道约 110–170；重新部署后的实时画面更亮，为 215–250。垫子低于 70。
+- 腐蚀后单个适配器保留 245–650 个像素，一团卷起的线缆最多残留 73 个，因此 `min_pixels` 取 150。
+- 实时画面中，三个适配器计数为 1709，只剩一个时约 620；抹掉适配器、保留线缆时为 91，判为已清空。
+- 光斑腐蚀后的范围约为 x 388–460、y 176–350，排除区取 `[392, 170, 75, 185]`，与最近的适配器（右边缘 x 391）不重叠。
+
+SJDrealman 标定（2026-11-19，当前配置）：
+
+- 物体是**黑色**电源适配器，垫子是饱和度很高的青绿色，所以 `min_channel` 取 0，只靠饱和度区分：垫子 `max-min` 约 79（ROI 内没有一个像素 ≤45），适配器约 8。`max_chroma` 取 35。节点名仍是 `WhiteObjectsRemain`，但这组参数下黑色和白色物体都能检测到。
+- ROI `[178, 122, 372, 236]` 取在垫子边缘以内（垫子约 x 150–568、y 95–387，略有倾斜）。垫子外是低饱和度的灰墙和白色支架，ROI 不能越过垫子边缘。
+- 检测时右臂停在它的起始位姿，夹爪伸到垫子右边缘上方（约 x 470–570、y 220–290）。不排除的话，空垫子也会计到 150–480，所以排除区取 `[462, 208, 90, 92]`。落在这个区域里的物体看不到。
+- 左臂停在放置位姿（J1=79.455°）时不在 D435 画面里。对照了一帧示教录像：右臂夹爪的位置与实时画面相同，左臂在画面左侧。所以放下的物体不会落回垫子上。
+- 用一帧实时画面验证（左臂停在放置位姿）：空垫子计 0；一个适配器计 827（`max_chroma` 30–40 时为 754–890）；它的线缆被腐蚀去掉，计 0。`min_pixels` 保持 150。
+- 只验证了这一帧的光照。灯光变化后垫子上出现低饱和度的反光，就会被当成物体，循环一直不会结束。这时先抓一帧图像再调排除区或 `max_chroma`。
+
+相机、垫子或灯光挪动后，需要重新标定 ROI 和排除区。
+
+dry-run 时不读相机，直接报告桌面已清空，因此 dry-run 只跑一个周期就结束。
+
+### 操作流程
+
+**1. 准备（每次重建容器后都要做）**
+
+- 确认机器人栈正常：三条臂的 `joint_states` 都在约 30 Hz，`/l|m|r/execute_motion` 都在线，全局相机 `/camera_global/d435/color/image_raw` 有图像（`rgb8`）。
+- 检查右夹爪：读 `/gripper_right/position` 和 `/gripper_right/alarm`。重建容器后，夹爪常会停在半开的位置（如 900）且报警为 32（0x20），不响应指令。依次调用 `/gripper_right/reset` 和 `/gripper_right/enable` 即可恢复（必要时再调用 `open`）。报警值会一直保持 32，但 policy 链路上的任何环节都不检查它，不影响运行。
+- 布置场景：适配器放在绿色垫子上，避开右侧的反光排除区（`object_detection.exclude_xywh`）；收纳盒放在放置侧；清空工作区；有人手持急停。
+- 确认左臂在起始位姿附近。进入 policy 模式的第一步回位受 5 s 的切换超时限制。正常结束时 `pick_done_home` 会自动回位；如果上一次以 `FAILED` 结束、手臂停在远处（例如 J1 = 79.455°），需要先在 :8765 的运动面板把左臂移回起始位姿。
+
+**2. 先跑一遍 dry-run**
+
+```bash
+REALMAN_BT_DRY_RUN=true ./rm65 bt control_pick
+```
+
+也可以在 :8765 的"行为树"卡片中选择 `control_pick`，不勾选真实运动后点"启动"。然后选择"Policy / 抓取清台"：一轮中所有步骤都只做校验，检测直接报告桌面已清空，随后停在 policy 空闲。确认没有 `FAILED` 后，终止这次 dry-run。
+
+**3. 真机运行**
+
+```bash
+REALMAN_BT_DRY_RUN=false ./rm65 bt control_pick
+```
+
+在 :8765 上，勾选真实运动后启动也可以。然后选择"Policy / 抓取清台"。`activation: auto` 下，选择即开始运动：三臂回到起始位姿，然后每轮依次执行抓取（约 10–15 s）、抬升、J1 转到 79.455°、松爪、检测，有物体就继续下一轮；桌面清空后三臂回到起始位姿，停在 policy 空闲。
+
+**4. 结束**
+
+在 :8765 点"终止行为树"，或在终端按 Ctrl-C。终止不会让手臂移动。也可以先选择 `none` 停止当前动作，行为树保持运行。运行中需要紧急停下时，拍急停，**不要用"重启 Docker"**：重启会直接杀掉 `PolicyRun`，来不及执行停止流程，策略桥接会停在激活状态（见下表）。
+
+**5. 出现 FAILED 时**
+
+`FAILED` 后输入模式会自动切到 `none`。可以从以下几处查看原因：:8765 上显示的 FAILED 说明、`logs/behavior-trees/<时间>/runtime.json`，以及每次尝试的轨迹 `logs/policy-attempts/policy_attempt_*.csv`。常见原因：
+
+| 现象 | 原因与处理 |
+| --- | --- |
+| `input mode switch timed out` | 手臂离起始位姿太远，回位超过 5 s。先手动回位，再选择 policy |
+| 回位被拒（`goal rejected`，驱动日志 `arm r is busy`），尝试次数很快用完 | 策略桥接停在激活状态（`/policy/stats` 的 `allow_publish = 1`），进入 policy 后 router 立刻占用被驱动的臂。通常是运行中途重启了容器。调用 `/policy/deactivate`（`std_srvs/SetBool`，`data: true`）后再试 |
+| 重启容器后右夹爪不动、报警 32 | 依次调用 `/gripper_right/reset` 和 `enable` |
+| `wrong_task` | 夹着物体转向收纳盒，策略没有按 pick 的 prompt 执行。核对 prompt 与模型 |
+| 尝试次数用完 | 连续抓空、超时或卡住。检查物体位置是否在训练分布内，必要时调整摆放 |
+| `no image on /camera_global/...` | 全局相机没有画面。检查相机进程 |
+| 循环一直不停 | 检测误判。抓一帧图像，核对 ROI、排除区和阈值（`policy_task.yaml` 的 `object_detection`） |
+
+修改 `policy_task.yaml`（例如 `attempts`、`pick_cycle`、`object_detection`）后，需要重启 `./rm65 bt control_pick` 才会生效。
+
+转动路径于 2026-10-20 在空载下确认无障碍。同日真机运行：单个物体一轮完整成功（28 s）。三个物体的那次，3 次尝试都是抓空后转向收纳盒（`wrong_side_empty`），合爪时 J2 只有 54–62°，成功那轮是 65.6°，即在物体上方合了爪。重试和失败流程都按设计执行，但"还有物体 → 下一轮"这条路径尚未在真机上走通。
+
+## 节点
+
+| 节点 | 作用 | 失败时 |
+| --- | --- | --- |
+| `GripperReady` | 读取 `/gripper_<name>/position`；夹爪未张开时调用一次 `/gripper_<name>/open`，并等待位置回到阈值以内 | 服务缺失、没有位置数据、请求被拒绝或超时：判为故障 |
+| `PolicyRun` | 预检、激活、监督一次尝试，并按固定顺序停止 | 见下表 |
+| `WhileGraspHeld` | 装饰节点：子节点（搬运运动）执行期间持续读 `/gripper_<name>/position`，夹爪合到底（`verdict.empty_position_min` 以上）持续 `grasp_check.carry_lost_sec` 即 halt 子节点 | 物体掉落：可重试的失败，写入 `policy_failure_reason`；子节点失败或读不到夹爪位置：判为故障 |
+| `MoveJointTo` | 读取当前关节角，只把一个关节转到绝对角度，再作为普通 MoveJ 执行（`control_pick.xml` 用它把 J1 转到放置侧） | 读角度失败、MoveJ 失败或超时 |
+| `WhiteObjectsRemain` | 用全局相机检测垫子上是否还有物体（低饱和度色块），结果写入 `table_clear` | 有物体返回 `SUCCESS`；桌面已清空时返回失败并写入 `table_clear=true`；没有图像、编码不支持或 ROI 超出图像范围时返回失败，并写入 `policy_failure_reason` |
+| `FailInputMode` | 把任务级失败转为输入模式 `FAILED`，原因取自 `policy_failure_reason`；协调器随后切换到 `none` | — |
+| `RetryUnlessFault` | 与 `Retry` 相同，但如果失败的叶节点已置位 `policy_fault`，会立即返回失败，不再消耗剩余次数；置位 `policy_timeout` 的失败按 `timeout_attempts` 单独计数，等待 `timeout_backoff_sec` 后再重试；`timeouts_to_parent="true"` 时改为立即返回这类失败、保留标志，交给外层的 `RetryUnlessFault` | 超时次数耗尽时，在 `policy_failure_reason` 前加上 `policy server timed out N times; last: `；运行开始、每次重试前和成功时清空 `policy_failure_reason`，失败结束时保留最后一次尝试的原因 |
+
+叶节点返回 `FAILURE` 并不会把输入模式标记为 `FAILED`，只有 `FailInputMode`（以及切换超时和 tick 异常）会这样做。因此"次数耗尽"必须经过它，否则持久路由会让失败的分支无限重来。
+
+## 一次尝试
+
+`PolicyRun` 依次执行以下步骤：
+
+1. **预检**：确认 `/policy/activate`、`/policy/deactivate`、`/policy/emergency_stop`、`/policy_router/emergency_stop` 四个服务均已发现；三条臂的 `joint_states`（`pika_config.yaml` 里 `skip: true` 的断电臂除外，见[断电的臂](#断电的臂)）、夹爪位置和 `/policy/stats` 都是最新数据；桥接报告自身处于 policy 模式。与此同时，`PolicyRun` 把任务的 prompt 发布到 `prompt_topic`（`/policy/prompt`，等待期间每 0.5 s 重发一次），直到 `/policy/stats` 中的 `prompt` 值与之一致才继续。桥接切换 prompt 时会清空动作队列，并立即重新发布统计。桥接处于暂停状态不会阻塞预检：下一步的 `/policy/activate` 会解除暂停。等待 `service_wait_sec` 后仍有项目不满足时，此时不会启动任何动作：如果缺的只是桥接本身（三个 `/policy/*` 服务或 `/policy/stats`），判为 `policy_timeout`；其余情况（机械臂或夹爪数据、路由服务、桥接不在 policy 模式、prompt 不一致、桥接版本过旧）判为故障。
+2. **激活**：`activation: auto` 时由 `PolicyRun` 调用 `/policy/activate`；`activation: operator` 时只等待操作员调用，等待期间不会有任何运动。
+3. **监督**：每个 tick 评估一次，判定规则见下表。
+4. **停止**：无论成败，依次调用 `/policy/deactivate`（`data: true`；`false` 反而会激活桥接）、`/policy/emergency_stop`、`/policy_router/emergency_stop`，每一步都等待回应或超时。最后再等待 `router_release_sec`，让路由释放速度会话，避免与下一步的 `ThreeArmMoveJ` 冲突。被 `halt()` 时，同样的三个调用会立即发出，但不等待回应。
+
+| 情况 | 结果 | 是否重试 |
+| --- | --- | --- |
+| 在收纳盒一侧放手，且曾夹住物体 | `SUCCESS`，`released_held` | — |
+| 在收纳盒一侧放手，但夹爪合到底 | 失败，`released_empty` | 是 |
+| `grasp_check`：闭合后夹牢 | `SUCCESS`，`grasp_held` | — |
+| `grasp_check`：闭合后合到底，或 `grasp_check.timeout_sec` 内没有夹牢 | 失败，`grasp_missed` | 是 |
+| `lift_and_hold`：抬起并保持，仍夹着物体 | `SUCCESS`，`lifted_held` | — |
+| `lift_and_hold`：夹住后物体掉落 | 失败，`dropped` | 是 |
+| 超过 `max_attempt_sec` 仍未完成（放手、抬起保持或夹牢） | 失败，`timeout` | 是 |
+| 夹爪闭合且指令几乎为零，持续 `stall.sec` | 失败，`stall` | 是 |
+| 某个关节电流持续 `current_guard.sustain_sec` 高于 `current_guard.limits_ma`（手臂顶在桌面或其他东西上） | 失败，`overcurrent` | 是：张开夹爪、回到起始位姿后重新抓取 |
+| 桥接因推理连续超时而自行暂停、桥接统计中断超过 `stats_stale_sec`、预检时桥接迟迟未就绪、`/policy/activate` 无回应 | 失败，`policy_timeout` | 是，按 `timeout_retry` 单独计数，先等待 `backoff_sec` |
+| 关节超出范围、关节速度过大、另外两臂漂移（跳过的臂不查）、`joint_states` 丢失、路由服务缺失、夹爪无法张开 | 故障，`fault` | 否，经 `FailInputMode` 进入 `FAILED` |
+| `lift_and_hold`：夹着物体转向收纳盒一侧 | 故障，`wrong_task` | 否，经 `FailInputMode` 进入 `FAILED` |
+| `lift_and_hold`：抓空后转向收纳盒一侧 | 失败，`wrong_side_empty` | 是 |
+
+以下关于放手和抓取的判定适用于 `release_over_bin`，`lift_and_hold` 和 `grasp_check` 的判定见上一节。**放手**指策略的夹爪指令在累计闭合足够久之后升到阈值以上，同时手臂位于收纳盒一侧（`release.joint_index` 对应的关节低于 `release.joint_below_deg`）。这一位置条件可以排除策略在垫子上为重新抓取而张开夹爪的情况。**抓取判定**依据放手前最后一段闭合期的夹爪位置：停在中间且出现过 `torque_reached`，说明夹住了物体；合到底且没有力矩，则是抓空。
+
+每次尝试的结果会写入黑板键 `policy_attempt_result`、`policy_grasp_verdict`、`policy_attempt_sec`、`policy_failure_reason`，并作为事件记入运行快照，可在 Web 监视器中查看。
+
+## 关节电流保护
+
+策略偶尔会把夹爪压向桌面并持续往下推。此时关节被卡住，电流一路升高；2026-10-23 16:28 和 16:42 两次都是 J2 电流先在约 10 A 处饱和，数秒后控制器过流保护，驱动随即失去这条臂（轨迹 CSV 里 J1、J2 电流变为 0，尝试以 `no r joint_states` 故障结束），必须到现场清除故障。
+
+`PolicyRun` 的监督器订阅 `/<臂>/joint_currents`，对受监督的那条臂逐个读数检查：某个关节的电流绝对值高于 `current_guard.limits_ma` 中对应的值，并且从第一次超限起连续 `current_guard.sustain_sec` 内的每个读数都超限，就锁存一次 `overcurrent`。这次尝试会像其他结束方式一样按顺序停止桥接和路由，然后 `RetryUnlessFault` 把它当作普通的失败尝试重试：`GripperReady` 张开夹爪、`policy_rehome` 回到起始位姿、`PolicyRun` 重新抓取。它占用一次 `attempts`，用完后和其他失败一样进入 `FAILED`。只要有一个读数回到阈值以下，该关节的计时就重新开始，所以加减速时的短暂峰值不会触发。尝试开始之前的电流不计入；同一时刻若还有故障，按故障处理。
+
+| 配置项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `current_guard.enabled` | `true` | `false` 时只记录电流，不据此结束尝试 |
+| `current_guard.limits_ma` | `[4000, 7000, 8000, 6000, 7500, 3000]` | J1 到 J6 的阈值，单位 mA，按绝对值比较 |
+| `current_guard.sustain_sec` | `0.5` | 超限需要持续的时间 |
+
+阈值来自 2026-10-20 到 10-23 的 67 条带电流的轨迹（取 0.5 s 窗口内的持续值）：正常的接近、抓取和抬起，J1 到 J6 分别不超过约 1.6、3.7、4.5、2.4、2.7、1.1 A；顶到桌面时 J2 在约 10 A 处饱和（J3 最高 16 A，J4、J5 在 9 A 处饱和），并持续数秒。用这组阈值回放全部轨迹：9 次顶桌的尝试会在开始顶压 0.5 s 后结束，其中包括上述两次掉线（判定时刻比掉线早约 6 s）；正常尝试一次也不会触发。其中有两次顶压后最终仍成功了（一次 `lifted_held`、一次放置任务的 `released_held`），启用保护后这类尝试会被提前结束并重试。
+
+调整阈值时应以轨迹数据为依据：比较新轨迹中 `i1_ma` 到 `i6_ma` 的正常值和顶压值，并同步修改 `test_policy_task_config_file.py` 中的期望值。
+
+## 策略服务超时重试
+
+真机上最常见的中断并非策略本身出错，而是策略服务暂时没有响应：serve 容器重启后，第一次推理要 JIT 编译约 26 s，这期间 WebSocket 循环被阻塞；Wi-Fi 被 Pika 定位程序挤占时，一次请求的往返时间会从 100 ms 升到数秒。桥接的单次推理在 `infer_timeout_s`（1.5 s）后超时，连续 `failure_pause_threshold`（5）次后会自行暂停，直到下一次 `/policy/activate` 才恢复。这类问题过一会儿通常会自行消失，所以不按故障处理，而是单独计数，稍等片刻后重试。
+
+**哪些算超时**（`PolicyRun` 判为 `policy_timeout`，并在黑板上置位 `policy_timeout`）：
+
+- 监督阶段，桥接报告 `paused=1`，即推理连续超时后自行暂停。尝试开始前收到的暂停状态不算，因为激活已经将其解除。
+- 监督阶段，`/policy/stats` 中断超过 `stats_stale_sec`。
+- 预检阶段，等待 `service_wait_sec` 后缺的只是桥接本身：`/policy/activate`、`/policy/deactivate`、`/policy/emergency_stop` 或 `/policy/stats`。
+- `/policy/activate` 在 `service_call_timeout_sec` 内没有回应。
+
+桥接虽然在线但与预期不一致（不在 policy 模式、prompt 不对、版本过旧），以及机械臂、夹爪或路由出现问题，仍然判为故障：这些情况重试无济于事。
+
+**两次尝试之间**：已激活的尝试照常按顺序停止（`/policy/deactivate`、两个急停、等待路由释放）。随后 `RetryUnlessFault` 等待 `timeout_retry.backoff_sec`，期间返回 `RUNNING`，不 tick 子树，桥接保持停止状态。等待结束后从 `GripperReady` 重新开始，即张开夹爪、回位，再执行 `PolicyRun`。在等待期间切换模式，会经 `halt()` 立即结束，不会残留状态。
+
+**次数与最终失败**：超时不占用 `attempts`，否则一次服务重启就可能耗尽抓取的重试次数。每个周期内允许 `timeout_retry.attempts` 次超时（首次计入，`-1` 不限），下一个周期重新计数。第 N 次超时后不再重试，`policy_failure_reason` 改为 `policy server timed out N times; last: <最后一次的原因>`，并经 `FailInputMode` 进入 `FAILED`，路由切换到 `none`。`policy_timeout` 标志保持置位，供父节点读取。
+
+```yaml
+# config/ros/policy_task.yaml
+timeout_retry:
+  attempts: 3        # 每个周期允许的超时次数，首次计入；-1 不限
+  backoff_sec: 20.0  # 每次超时重试前的等待时间
+```
+
+20 s 的取值依据：桥接要经过约 8 s 的连续超时（5 × 1.5 s）才会暂停，再加上 20 s 的等待，足以覆盖约 26 s 的 JIT 编译；短时的 Wi-Fi 拥塞也能在此期间恢复。如果是服务进程本身挂掉，三次超时后进入 `FAILED`，大约需要一分半。
+
+## 轨迹记录
+
+每次尝试（包括预检失败的尝试）都会生成一个 CSV 文件，保存在主机的 `~/realman_pi/logs/policy-attempts/policy_attempt_<UTC 时间>_<臂>.csv`（容器内路径为 `/opt/rm65_ws/logs/policy-attempts/`；同一秒内的两次尝试会加上 `_2` 后缀）。它是分析"这次尝试为何结束"的依据：行为树自身的事件列表只保留最近 200 条，会被 Web 页面每秒一次的轮询冲掉；而这个文件逐行立即写盘，即使进程被终止也不会丢失。
+
+文件开头几行以 `#` 开头，记录本次尝试的配置（`task=<名称> completion=<完成条件> prompt='<文本>'`、激活方式、关节范围、速度上限）；接着是列头，然后每个采样周期一行。数据行只在尝试进入监督阶段后才会出现：
+
+| 列 | 含义 |
+| --- | --- |
+| `t_sec`、`phase` | 进入监督后经过的秒数；`running` 为监督阶段，`stopping` 为停止阶段 |
+| `q1_deg` 到 `q6_deg` | 受监督机械臂的关节角 |
+| `drift_<臂>_deg` | 另外两条臂相对于尝试开始时的最大关节变化 |
+| `cmd_lin_mps`、`cmd_ang_radps` | 路由发给驱动的速度指令幅值（经限速钳制后） |
+| `policy_gripper` | 策略的夹爪指令，0 为闭合，1 为张开 |
+| `gripper_position`、`torque_reached` | 夹爪位置（设备单位）和力矩到达标志 |
+| `closed_total_sec` | 夹爪指令累计闭合的时间（用于放手判定） |
+| `allow_publish`、`paused` | 桥接的统计值 |
+| `i1_ma` 到 `i6_ma` | 受监督机械臂的关节电流（mA，来自驱动的 `/<臂>/joint_currents`），也是[关节电流保护](#关节电流保护)判定所用的读数 |
+
+没有读数的单元格留空。文件末尾是 `# result=`、`# grasp=`、`# seconds=`、`# reason=` 四行；被 `halt()` 中断的尝试记为 `# result=halted`。可以在 `policy_task.trace` 中关闭记录、修改目录或采样周期；文件写入失败只会缺少这份记录，不影响尝试本身。
+
+```bash
+ssh realman_ts 'ls -t ~/realman_pi/logs/policy-attempts | head -3'     # 最近三次
+```
+
+## 录制与偏离标注
+
+PolicyRun 每次尝试都会在 `/recording/attempt` 上通知录制服务：预检通过、准备激活策略时发 `START`（`activation: operator` 下等到看见操作员激活、开始监督时才发，因为等人的时间没有上限，会吃掉录制服务的停录时限；在等人时被 halt 什么都不发），尝试结束或被 halt 时发一次 `RESULT`（`outcome` 是上面的结果名，被 halt 时是 `halted`）。`grasp_check` 任务抓稳（`grasp_held`）时 PolicyRun 不发 `RESULT`：这次尝试要等后面的 WhileGraspHeld 搬运结束才算完，由它发 `RESULT`，`outcome` 是 `carried`（搬到释放位，成功）、`carry_dropped`（搬运中掉落）、`carry_fault`（搬运动作失败或没有夹爪位置）或 `halted`。所以一段录制从策略开始一直录到搬运结束，搬运中掉落的尝试记为失败。树里如果 PolicyRun 后面没有 WhileGraspHeld，下一次尝试发 `START` 之前先替上一次补发 `RESULT`（`grasp_held`，成功）。`attempt_id` 就是本次尝试的轨迹文件名（去掉 `.csv`），所以录制的 session 和[轨迹记录](#轨迹记录)能一一对上。`START` 带上这次尝试最多还会持续多久（`max_attempt_sec` 加 4 次服务调用超时和路由释放时间），`grasp_check` 任务再加 `grasp_check.carry_record_sec`（默认 125 s，即搬运自身的超时 2 + 60 + 60 s）。录制服务超过这个时间还没收到 `RESULT` 就自己停录。dry-run 和预检就失败的尝试什么都不发。
+
+录制服务（`realman_recording`）收到 `START` 后为这次尝试单独录一个 session，导出到 `realman/pi05-policy-rollouts` 数据集；操作员在 :8765 上标注的偏离区间写进同一个 session。没有启动录制服务时，这些通知没人接收，尝试照常运行。详见[策略运行偏离标注](./quality-annotation)。
+
+## 配置与激活方式
+
+各阈值的来源都写在 `policy_task.yaml` 的注释中；修改阈值时需要同时参考示教数据，改完后需重启 `./rm65 bt`。YAML 中写错的键不会被 ROS 报错（ROS 会忽略未声明的参数），因此 `test_policy_task_config_file` 要求文件中的键与加载器声明的键完全一致。
+
+`activation` 决定选择 policy 模式之后会发生什么：
+
+- `auto`（默认）：回位成功后，行为树自行激活并开始执行。**选择该模式就意味着机械臂会运动**，因此选择前要确认工作区已清空、有人手持急停。
+- `operator`：回位后，行为树等待有人调用 `/policy/activate`，每次尝试都需要重新等待。是否运动仍由这一人工操作决定。
+
+## 运行步骤
+
+先在无硬件条件下验证：
+
+```bash
+REALMAN_BT_DRY_RUN=true ./scripts/bt.sh control     # 选择 policy：回位只做校验，GripperReady 和 PolicyRun 只做记录
+```
+
+在真机上按阶梯推进，每一级通过后再进入下一级，全程有人手持急停。开始前确认 Wi-Fi 链路干净、Pika 定位程序已关闭，并且夹爪处于张开状态。
+
+1. `cycles: 1`、`attempts: 1`：执行一次尝试，验证监督、放手判定和停止顺序。
+2. `cycles: 1`、`attempts: 3`：验证重试时会张开夹爪、回位并重新开始。
+3. `cycles: 3` 及以上：验证周期和装饰节点的计数；每个周期前后拍照核对结果。
+
+```bash
+REALMAN_BT_DRY_RUN=false ./scripts/bt.sh control    # 然后在 Web 中选择 policy，或调用 select_input_mode
+```
+
+
+## 断电的臂
+
+某台机械臂长期断电时（例如 SJDrealman 的 m 臂），在 `config/ros/pika_config.yaml` 的 `pika_default_pose` 下给它写
+`skip: true`。这一个设置同时作用于两处：入口 `ThreeArmMoveJ` 不给该臂发 goal（见 [Pika 遥操作](./pika-teleop.md)）；
+executor 启动时也把它记进 `PolicyRun` 的跳过列表，预检不再等这条臂的 `joint_states`，运行中不会因为它没有数据而判故障，
+也不检查它的漂移。另一条不受驱动的臂照常检查。被驱动的臂（`policy_task.arm` 或 `PolicyRun` 的 `arm_id`）不能跳过，
+否则 executor 启动时直接报错。不加这个设置，断电臂会让每次尝试都在预检阶段以
+`policy is not ready to start ... m joint_states` 故障结束（2026-11-17 在 SJDrealman 上实测）。跳过列表只在 executor
+启动时读取一次，改了 `pika_config.yaml` 之后要重启行为树才生效。
+
+## 排障
+
+| 现象 | 原因与处理 |
+| --- | --- |
+| 选择 policy 并回位后，长时间没有动作 | `PolicyRun` 正在预检中等待：查看运行快照事件或桥接日志，缺少的服务、数据或 `mode_active=0` 会写在原因中；如果是 `operator` 模式，则是在等待 `/policy/activate` |
+| `FAILED`，原因含 `policy is not ready to start` | 预检超时：原因中会列出缺少的项，可能是四个服务、三条臂的 `joint_states`、夹爪位置或 `/policy/stats`。如果缺的只是桥接，会先按超时重试，原因前面会加上 `policy server timed out N times` |
+| 原因含 `policy bridge prompt is '…', waiting for '…'` | 桥接没有切换到该任务的 prompt：确认桥接订阅了 `prompt_topic`，并且没有其他进程在向 `/policy/prompt` 发布别的文本 |
+| 原因含 `does not report its prompt in /policy/stats (too old a bridge)` | 桥接容器仍是旧代码，统计中没有 `prompt`：重建桥接镜像或同步代码后重启。prompt 未确认前不会激活桥接 |
+| `wrong_side_empty` | 抓空后转向收纳盒，会自动重试；如果频繁出现，检查物体位置是否在训练分布内、夹爪是否张开充分 |
+| `wrong_task` | 执行抓起任务时夹着物体转向了收纳盒，说明策略没有按 prompt 区分任务：先核对 prompt 是否与训练视图逐字一致，再查看模型在离线 prompt 交换测试中的区分度 |
+| `FAILED`，原因以 `policy server timed out N times` 开头 | 策略服务在一个周期内超时了 `timeout_retry.attempts` 次，最后一次的原因跟在 `last:` 之后。`paused itself` 表示桥接连续推理失败后自行暂停，通常是 Wi-Fi 被占满（Pika 定位程序挤占链路时，往返延迟会从 100 ms 升到数秒），或 serve 容器刚重启、尚未预热：先在 serve 容器内做一次推理预热，再选择 policy |
+| 一次尝试结束后，约 20 s 没有动作 | `policy_timeout` 之后的 `backoff_sec` 等待：运行快照中会有一条 `WARN` 级别的 `attempt_end ... result=policy_timeout` 事件 |
+| 一轮结束后夹爪未张开就开始下一轮 | 不会发生：每次尝试的第一步都是 `GripperReady`，夹爪无法张开会判为故障 |
+| 一直是 `released_empty` | 抓空：查看相机画面和 `policy_grasp_verdict`。这是策略精度问题，不是监督问题 |
+| 想知道某次尝试为何结束 | 查看对应轨迹 CSV 末尾的四行，以及最后几行数据 |
+| `overcurrent` | 某个关节持续过流，通常是夹爪顶在桌面上；会自动张开夹爪、回位后重新抓取。原因中会写明关节和电流值。如果频繁出现，查看对应轨迹 CSV 中合爪前的 J2 角度和电流：策略合爪位置过低 |
+| 夹着物体不动 | 判为 `stall`，下一次尝试会先张开夹爪；如果反复出现，说明策略在抓取后进入了训练分布之外的状态，见 [VLA 策略桥接节点](./policy-bridge) |
+
+## 验证
+
+```bash
+colcon build --symlink-install --packages-select realman_bt
+colcon test --packages-select realman_bt
+colcon test-result --verbose
+```
+
+相关测试包括：`test_policy_supervisor`（判定逻辑，不依赖 ROS）；`test_policy_run_node` 和 `test_gripper_ready_node`（用模拟的桥接、路由、夹爪和三臂关节状态驱动，检查调用顺序，以及哪些情况判为 `policy_timeout`）；`test_retry_unless_fault_node`（故障立即停止、超时单独计数、等待、原因前缀）；`test_input_mode_executor`（树的结构、从 `FAILED` 到 `none` 的通路、计数经黑板传入树）；`test_control_router_tree`（XML 契约）。这些 C++ 测试开头都加了 `#undef NDEBUG`，因此 Release 构建也不会移除其中的 `assert`。

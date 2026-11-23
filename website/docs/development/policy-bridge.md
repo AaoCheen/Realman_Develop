@@ -1,0 +1,238 @@
+# VLA 策略桥接节点
+
+`policy_bridge` 的 `policy_bridge_node` 是 VLA（Vision-Language-Action）策略服务与 realman_pi ROS 2 图之间的**纯协议转换层**。它与 Pika、Web 等输入源平级：上行把图像、7 维 state 和 prompt 打包经 WebSocket 发给策略服务；下行把返回的动作块 `(16, 7)` 按当前模式原样包装成 ROS 2 消息发布。节点**不读机械臂状态做闭环、不积分、不开关 Action session、不直连夹爪串口**。
+
+## 架构与所有权
+
+```text
+策略服务 (WebSocket)
+   ▲  obs: {state[7], wrist_image, global_image, prompt}
+   │  actions: (16,7)
+   │
+policy_bridge_node ── 上行 ObservationBuilder（订阅配置的 topic）
+   │                 └ InferenceScheduler（滚动时域 + 线程池 + 防重入）
+   │                 └ WsClient（序列化 + 超时 + 指数退避）
+   │
+   └── 下行 ChunkBuffer(deque) → Dispatcher → GripperPublisher
+          ├ /pi05_policy/{l,r}/cartesian_velocity  (TwistStamped)
+          ├ /pi05_policy/{l,r}/cartesian_pose      (PoseStamped, 一期不启用)
+          └ /pi05_policy/{l,r}/gripper_percentage  (Float32)
+
+realman_bt_executor ── /realman_bt_executor/input_mode_state ──▶ ModeWatcher（唯一模式来源）
+```
+
+模式只由 `ModeWatcher` 订阅的 `InputModeState` 决定；合法的 `active_mode` 字面量唯一来源是 [`config/behavior-trees/control_router.xml`](https://github.com/QingTianRobot/realman_pi/blob/main/config/behavior-trees/control_router.xml) 的 `InputModeGuard`，桥接节点自身不定义模式枚举。
+
+实现入口：
+
+- 节点装配与发布循环：`src/policy_bridge/policy_bridge/policy_bridge_node.py`
+- 配置加载与启动校验：`src/policy_bridge/policy_bridge/config_loader.py`
+- 模式映射：`src/policy_bridge/policy_bridge/mode/mode_watcher.py`
+- 上行观测：`src/policy_bridge/policy_bridge/observation/{image_aggregator,state_composer,observation_builder}.py`、`prompt_provider.py`
+- 推理：`src/policy_bridge/policy_bridge/inference/{ws_client,scheduler,validators}.py`
+- 下行：`src/policy_bridge/policy_bridge/action/{chunk_buffer,dispatcher,smoother}.py`、`gripper/gripper_publisher.py`
+- 生命周期与指标：`src/policy_bridge/policy_bridge/lifecycle/services.py`、`stats.py`
+
+## 配置
+
+权威配置是 [`config/ros/policy_bridge.yaml`](https://github.com/QingTianRobot/realman_pi/blob/main/config/ros/policy_bridge.yaml)，容器映射在 [`config/docker/compose.yaml`](https://github.com/QingTianRobot/realman_pi/blob/main/config/docker/compose.yaml)。不要在源码包内维护第二份运行配置。所有 topic 名都是字符串配置，驱动缺少对应生产者/消费者时改配置即可，不改代码；启动时**不校验 topic 是否存在**。
+
+| 段 | 字段 | 单位/范围 | 作用 |
+| --- | --- | --- | --- |
+| `network` | `server_host` | 字符串，`${POLICY_WS_HOST:-127.0.0.1}` | 策略服务地址，敏感值走环境变量 |
+| `network` | `server_port` | `1..65535`；当前 `18000` | 策略服务端口（OpenPI 默认） |
+| `network` | `infer_timeout_s` | 秒；当前 `1.5` | 单次推理超时，超时丢弃本次不覆盖旧队列 |
+| `network` | `reconnect_backoff` | `initial_s/max_s/factor` | 断开后指数退避重连 |
+| `network` | `inference_threads` | `>=1`；当前 `2` | 推理线程池大小，避免阻塞发布定时器 |
+| `observation.image_topics[]` | `resize` | `[H, W]`；当前 `[224, 224]`，留空 = 原样发送 | 上行前按 openpi 的 `resize_with_pad` 缩放（保持长宽比、居中、补黑边，PIL 双线性），与服务端 `ResizeImages(224, 224)` 同一算法，见下文「上行带宽与延迟」 |
+| `action` | `action_horizon` | 当前 `16` | 服务端返回 chunk 的步数 |
+| `action` | `action_dim` | 必须 `7` | 6 维笛卡尔 + 1 维夹爪 |
+| `action` | `steps_per_inference` | `<= horizon`；当前 `5` | 每块只取前 N 步入队（滚动时域） |
+| `action` | `inference_lead_steps` | `>=0`；当前 `4` | 队列剩余 `<=` 此值时提前触发推理 |
+| `action` | `action_clip` | `[min,max]`；当前 `[-1,1]` | 归一化动作限幅 |
+| `downlink` | `command_namespace` | 以 `/` 开头；`/pi05_policy` | 下行命名空间，与 `/pika` 平级 |
+| `downlink` | `publish_rate_hz` | `>0`；当前 `30.0` | 必须快于驱动 `velocity_watchdog_ms`（100ms），且等于训练数据帧率（30 fps），因为每个周期取一步动作 |
+| `downlink` | `smoothing_alpha` | `(0,1]`；当前 `0.6` | 一阶低通 `a=α·new+(1-α)·last` |
+| `downlink.velocity` | `twist_scale` | `linear 0.25 m/s`、`angular 0.6 rad/s`（与训练动作归一化同一组） | 归一化 → SI 单位 |
+| `downlink.velocity` | `frame_ids` | `l/work/pikabase` / `r/work/pikabase` | 各臂单位变换 WORK 系（方向与基座一致），须与路由校验的 `frame_id` 和训练数据的命令坐标系一致 |
+| `downlink.gripper` | `clamp` | `[0,1]`；`0=闭合,1=张开` | 与 `gripper_manager` 语义一致 |
+| `mode.mapping` | `velocity_modes` | 当前 `[policy]` | 映射为内部 `velocity` |
+| `mode.mapping` | `inactive_modes` | `[web,pika,none]` | 映射为内部 `inactive` |
+| `stats` | `failure_pause_threshold` | 当前 `5` | 连续失败 `>=N` 暂停，需显式 activate 恢复 |
+
+一期 `arm_names` 固定 `[l, r]`，节点以单个 `active_side`（launch 默认 `left`，Docker `policy` 服务默认 `left`，2026-11-19 前为 `right`）驱动单臂动作流；双臂独立流为二期扩展。上行 `state[0:6]` 一期取每臂 `joint_states` 前 6 个关节位置占位，`state[6]` 由夹爪 `Float64` 设备单位经 `open/close_position` 换算为 `0..1`。
+
+## ROS 接口
+
+订阅（上行观测源，topic 名全部来自配置）：
+
+| 用途 | 默认 topic | 类型 |
+| --- | --- | --- |
+| 腕部图像 | `/camera_left/color/image_raw`（2026-11-19 前为右臂 `/camera_right/...`） | `sensor_msgs/Image` |
+| 全局图像 | `/camera_global/d435/color/image_raw` | `sensor_msgs/Image`（独立 RealSense D435，区别于三路 Orbbec 臂相机） |
+| 关节状态 | `/l/joint_states`、`/r/joint_states` | `sensor_msgs/JointState` |
+| 夹爪位置 | `/gripper_left/position`、`/gripper_right/position` | `std_msgs/Float64` |
+| 夹爪行程 | `/gripper_left/limits`、`/gripper_right/limits` | `gripper_ros2_msgs/GripperLimits`（可靠、`transient_local`、深度 1）；`state[6]` 的开位、闭位随它更新 |
+| 模式状态 | `/realman_bt_executor/input_mode_state` | `realman_msgs/InputModeState`（`phase` 为 uint8：ACTIVE=0/SWITCHING=1/FAILED=2） |
+| prompt 更新 | `/policy/prompt` | `std_msgs/String` |
+
+发布（下行）：
+
+| topic | 类型 | 模式 | 备注 |
+| --- | --- | --- | --- |
+| `/pi05_policy/{l,r}/cartesian_velocity` | `geometry_msgs/TwistStamped` | velocity | `stamp` 为 ROS 时钟 `now()`，50Hz |
+| `/pi05_policy/{l,r}/cartesian_pose` | `geometry_msgs/PoseStamped` | position | 一期不启用（`position_modes: []`） |
+| `/pi05_policy/{l,r}/gripper_percentage` | `std_msgs/Float32` | velocity+position | `0..1`，`0=闭合` |
+| `/policy/stats` | `diagnostic_msgs/DiagnosticArray` | 始终 | 计数与实时指标；暂停时 level=ERROR |
+
+服务（生命周期）：
+
+| 服务 | 类型 | 行为 |
+| --- | --- | --- |
+| `/policy/activate` | `std_srvs/SetBool` | 清队、重置失败计数、允许推理与发布 |
+| `/policy/deactivate` | `std_srvs/SetBool` | 停止发布，观测继续 |
+| `/policy/emergency_stop` | `std_srvs/Trigger` | 清队、立即停发 |
+| `/policy/set_prompt` | `std_srvs/SetBool` | 一期占位，prompt 走 topic |
+| `/policy/force_infer` | `std_srvs/Trigger` | 立即推理一次 |
+
+## WebSocket 协议
+
+传输采用 **OpenPI `WebsocketPolicyServer` 协议**：msgpack 承载 NumPy 原始字节（**不是 JSON**），由包内 vendored 客户端 `src/policy_bridge/policy_bridge/inference/openpi_client/` 实现（`WebsocketClientPolicy` + `msgpack_numpy`）。`WsClient` 只负责惰性连接、`infer` 超时、指数退避与错误计数；obs 以 dict 原样交给 transport 打包，字段名即 obs 的 key。
+
+obs 字段名固定，值为 NumPy 数组 / 字符串：
+
+```python
+# 请求（上行 obs）—— 由 ObservationBuilder 组装
+{"state": np.float32[7],              # 6 维笛卡尔/关节 + 1 维夹爪
+ "wrist_image": np.uint8[H, W, 3],    # key = observation.image_topics[].name；H, W = 该项的 resize
+ "global_image": np.uint8[H, W, 3],
+ "prompt": "pick the red block"}
+
+# 响应（下行 actions）—— 服务端返回
+{"actions": np.float32[16, 7]}        # 形状必须 (action_horizon, action_dim)
+```
+
+连接建立时服务端先发一帧 metadata，客户端 `recv` 后才进入请求-响应；每次 `infer` 发一帧 obs、收一帧 actions。响应经 `validators.check`：形状必须精确为 `(action_horizon, action_dim)`、全部有限，否则整块拒绝（绝不下发到机械臂）；合法值 clip 到 `action_clip`。只取前 `steps_per_inference` 步入队。
+
+> `action_horizon` 必须与服务端实际返回的行数一致（如 pi0 常见 50 行），否则整块被 `validators.check` 按 shape 拒绝。上线前用 `mock_policy_server` 或 `get_server_metadata()` 核对。
+
+## 上行带宽与延迟
+
+每次推理上传两路图像。模型只吃 224×224（训练和推理时服务端都对每张图做 `ResizeImages(224, 224)` = openpi 的 `resize_with_pad`），所以桥接**在上行前先做同一个缩放**：`observation.image_topics[].resize` 配成 `[224, 224]`，服务端那一步因输入已是 224×224 而原样返回，模型看到的像素与服务端自己缩放完全一致（`test_image_aggregator.py` 逐字节比对 openpi 的实现），上传量约缩小 6 倍。
+
+不能直接把 480×640 拉伸成 224×224：训练用的是保持长宽比的 `resize_with_pad`，拉伸会改变画面几何，模型没见过。
+
+实测（2026-10-14，机械臂主机经 Wi-Fi 局域网到 GPU 服务器，RTX 5090，pi0.5 动作专家微调检查点，`steps_per_inference: 4`、30 Hz 发布需要 ≥ 7.5 次/秒，即单次往返 ≤ 133 ms）：
+
+| 上行图像 | 往返均值 | p95 | 可持续频率 | 结论 |
+| --- | --- | --- | --- | --- |
+| 480×640 ×2（约 1.8 MB） | 309–341 ms | 约 400–465 ms | 约 3 次/秒 | 队列会被抽干，动作断续 |
+| 224×224 ×2（约 0.3 MB） | 102–109 ms | 约 140 ms | 约 9–10 次/秒 | 满足 |
+
+其中模型本身约 60 ms，480×640 时其余约 250–280 ms 是 Wi-Fi 上行与序列化。
+
+**调度参数要和有效耗时匹配。** 桥接一次只跑一个推理，队列是追加式 FIFO，每个发布节拍（30 Hz）取一步；只有在节拍上才会检查是否触发。一次推理的有效耗时（上表往返加桥接内部处理，约 140 ms）里队列必须还有动作，否则那个节拍什么也发不出去。仿真并与实测对齐（`steps_per_inference: 4`、`inference_lead_steps: 2` 时实测只有 21 Hz，空节拍约 30%）：
+
+| `steps_per_inference` / `inference_lead_steps` | 空节拍 | 发布频率 | 动作从观测到执行的延迟（均值 / p95） |
+| --- | --- | --- | --- |
+| 4 / 2（旧） | 约 30% | 约 21 Hz | 约 206 / 267 ms |
+| 5 / 4（当前） | 约 1% | 约 29.8 Hz | 约 235 / 300 ms |
+| 6 / 5 | 0% | 30 Hz | 约 283 / 367 ms |
+
+网络再慢 40 ms 时，5 / 4 的空节拍升到约 15%，6 / 5 仍只有约 3%，更慢就继续加大 lead。路由对短于 100 ms 的空档会重复上一条命令，所以空节拍只让动作变慢、变拖，不会让手臂停住，但执行的轨迹会偏离训练时的时间尺度。策略服务和机械臂主机不在同一台机器时，上线前用同样的方式量一次往返：用桥接容器里的 `policy_bridge.inference.openpi_client` 连服务端，发相同尺寸的 obs，看 `server_timing.infer_ms` 与总往返之差。
+
+## 路由：policy_control_router
+
+bridge 发布的 `/pi05_policy/{l,r}/*` 由 `policy_control_router`（`src/behavior/realman_bt/scripts/`）消费，与 Pika、键盘路由并列，随 `control_router.launch.py` 启动。设计见 `docs/superpowers/specs/2026-10-13-policy-input-router-design.md`，配置见 `config/ros/policy_router.yaml`。
+
+- **入场回位**：切入 `policy` 时行为树先用 `ThreeArmMoveJ`（10%）把三臂移到 `pika_default_pose`，成功后才 `ACTIVE`（见[行为树控制权](./behavior-tree-control)）。训练数据的 130 个 episode 全部从这个位姿起步，策略必须从它见过的状态开始。回位完成后策略不会自动开始，要再调 `/policy/activate`。
+- 只在行为树 `active_mode == policy` 且 `phase == ACTIVE` 时工作；离开模式立即发零速并取消会话。
+- 两只臂都路由；某只臂没有策略流就不会开会话。每只臂一个 `CartesianVelocity` 会话（WORK 系 `work/pikabase`，低跟随）。
+- 每条命令校验：`frame_id`、分量有限、`header.stamp` 不超过 `stale_ms`（默认 100 ms）；再按路由自己的限速（默认 0.10 m/s、0.25 rad/s）限幅，独立于 bridge 的 `twist_scale`。
+- 流停了先置零，`input_timeout_ms`（默认 500 ms）后释放会话；绝不为过期命令开会话。
+- **会话开始的漂移保护**：会话开始后 2 s 内，只要发出的命令都是零，任一关节偏移超过 1° 就取消会话并锁定，需要先停掉 bridge（`/policy/deactivate`）再重新激活才能重试。
+- 夹爪：转发到 `/gripper_{left,right}/percentage/command`，值必须在 `[0,1]`，限 10 Hz。
+- 急停：服务 `/policy_router/emergency_stop`（`Trigger`）立即置零并取消会话；切换到其他模式、停掉 bridge、驱动 100 ms 看门狗是另外三条停止路径。
+- 运动的开关是 bridge 的 `/policy/activate`；路由不再设第二道开关。谁来调用它由 `config/ros/policy_task.yaml` 的 `activation` 决定：`auto`（默认）由行为树的 `PolicyRun` 在预检通过后调用并全程监督，`operator` 则等待操作员手动调用，见 [Policy 任务](./policy-task)。`dry_run` 沿用整个 launch 的约定（默认 `true`，上机时显式关闭）。
+
+## 安全与看门狗约定
+
+- **不发布 ≠ 发零速**：队列空 / inactive / 急停时停发，让驱动的 `CartesianVelocitySession` 100ms 看门狗接管。
+- 发布频率必须快于 100ms（默认 50Hz），`header.stamp` 必须为 ROS 时钟 `now()`。
+- 推理在 WS/线程池线程完成，**绝不在该线程直接 publish**；发布只发生在定时器线程。
+- 防重入：一次推理进行中忽略新触发；连续失败达 `failure_pause_threshold`（5）暂停，需 `/policy/activate` 恢复。
+- 模式切换与 prompt 变更都会清队，防止旧任务动作污染新 session。
+
+## Docker 启动
+
+`./rm65 up policy` 在生产图（`realman_bringup_remote` + `realman_web_control`）基础上追加启动独立的 `policy_bridge` 容器。该容器与 Web control 平级，共享 `ROS_DOMAIN_ID`、只读挂载 `config/`、写入 `logs/`，通过 `POLICY_WS_HOST` 解析策略服务地址。桥接容器保持空闲，直到 Router 选择 policy 模式且调用 `/policy/activate`。
+
+开发环境可在已构建并 source 的 ROS 2 工作区中运行（dev shell 用仓库内配置路径，容器路径 `/opt/rm65_ws/...` 在宿主机不存在）：
+
+```bash
+colcon build --packages-select realman_msgs policy_bridge
+source install/setup.bash
+ros2 launch policy_bridge policy_bridge.launch.py \
+  config_file:=$PWD/config/ros/policy_bridge.yaml \
+  active_side:=left
+```
+
+### 无模型联调：mock 策略服务
+
+真实策略服务未就绪时，用包内 mock 服务在 `:18000` 顶替，验证连接、obs 字段与动作回流（不涉及模型与机械臂）：
+
+```bash
+# 终端 A：起 mock 服务（random 让发布的 Twist 数值可见变化）
+ros2 run policy_bridge mock_policy_server --port 18000 --mode random
+# 或免安装：python3 -m policy_bridge.tools.mock_policy_server --port 18000 --mode random
+
+# 终端 B：起节点，指向同一端口（server_port 默认已是 18000）
+ros2 launch policy_bridge policy_bridge.launch.py config_file:=$PWD/config/ros/policy_bridge.yaml
+```
+
+mock 服务日志会打印每次收到的 obs key 与 shape（`state (7,)`、`wrist_image (H,W,3)` …），据此确认上行契约；随后按下面「健康判断与排障」activate + force_infer 观察下行 topic。切到真实服务只改 `POLICY_WS_HOST`（及必要时 `server_port`），代码与配置结构不变。
+
+## 健康判断与排障
+
+按以下顺序验证，避免在链路未知时直接运动：
+
+1. `ros2 lifecycle`/`ros2 node info /policy_bridge_node` 确认节点与 5 个服务已注册。
+2. `ros2 topic echo --once /policy/stats` 查看 `queue_remaining`、`paused`、`mode_active`、`allow_publish` 指标。
+3. `ros2 topic echo /realman_bt_executor/input_mode_state` 确认 `active_mode=policy` 且 `phase=0(ACTIVE)`，否则内部模式为 inactive，不会发布。
+4. 先 `ros2 service call /policy/activate std_srvs/srv/SetBool "{data: true}"`，再 `ros2 service call /policy/force_infer std_srvs/srv/Trigger`。
+5. `ros2 topic echo /pi05_policy/l/cartesian_velocity` 核对 `TwistStamped` 的 `frame_id`、`stamp` 与数值缩放。
+
+```bash
+docker compose ps policy_bridge
+docker compose logs --tail=100 policy_bridge
+docker compose exec policy_bridge ros2 topic echo --once /policy/stats
+```
+
+## 已知限制与风险登记表
+
+桥接是纯发布层，以下缺口按里程碑归属其他模块，不在本节点内实现：
+
+| 编号 | 依赖 | 后果 | 归属 | 里程碑 |
+| --- | --- | --- | --- | --- |
+| R1 | velocity session 需 Router 先发 `/{arm}/cartesian_velocity` Action goal 开门 | 桥接发 `TwistStamped` 但 session 未激活会拒绝命令 | 行为树侧 | 一期联调 |
+| R2 | 驱动无笛卡尔 state topic | 一期用 `joint_states` 占位上行 | 驱动侧 | 二期 |
+| R3 | position 模式无流式位姿消费者（驱动走 `execute_motion` Action） | `PoseStamped` 无人订阅 | 驱动/Router | 二期 |
+| R4 | 夹爪 manager 用 `GripperPercentage` 服务而非 topic | `Float32` topic 暂无消费者 | 需 topic→service 适配 | 二期 |
+| R5 | 只有 `cartesian_velocity/command` 带 100ms 看门狗 | 发到别的 topic 无看门狗保护 | Router/驱动 | 一期确认 |
+
+## 验证
+
+**无硬件回归测试**（`cd src/policy_bridge`）：
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=".:$PYTHONPATH" \
+  python3 -m pytest test/ -q          # 86 passed
+```
+
+- `test_integration_mock_ws.py`：dict 级 mock transport + 录制的假 chunk，覆盖模式门控发布、ROS 时钟 stamp、50Hz 周期、一块 → `steps_per_inference` 次发布、队列空/inactive 停发。
+- `test_ws_client.py::test_ws_client_real_socket_roundtrip`：起一个真实 localhost WebSocket 服务，走 vendored `WebsocketClientPolicy` + msgpack 完整往返，断言收到 `(16,7)` actions、连接建立/关闭状态正确——**证明真实网络链路可用**。
+- msgpack 序列化往返（state float32 / 图像 uint8 / actions）单测。
+
+**无模型联调**：用上文 `mock_policy_server` 在 `:18000` 顶替真实服务，跑通节点上行 obs → 下行 topic 全链路。
+
+**真机联调**：仅在 R1 开门后、显式操作决策、清空工作区、低速、急停可达时进行；`action_horizon` 需先与真实服务返回行数对齐。

@@ -1,0 +1,67 @@
+# Three RM65 layout used by three_robots.launch.py.
+#
+# Coordinates are expressed in metres and angles in radians. The global
+# `world` frame is the RViz Fixed Frame. Positive X points to the right side
+# of the layout; positive Y points toward the rear of the workspace.
+robots:
+  # The left-arm base remains the calibration reference and is deliberately
+  # unchanged by the three-arm ChArUco layout write-back.
+  l:
+    model: RM65-B
+    namespace: l
+    frame_prefix: l/
+    parent_frame: world
+    x: -1.0
+    y: 0.0
+    z: 0.0
+    roll: 0.0
+    pitch: 0.0
+    yaw: 0.0
+
+  # Production ChArUco result. Do not replace with the old (0, 0, 0, pi)
+  # planning pose: GitHub Pages and ROS launch both consume these metres/radians.
+  m:
+    model: RM65-B
+    namespace: m
+    frame_prefix: m/
+    parent_frame: world
+    x: -0.951261084347
+    y: 0.194742157588
+    z: -0.01881234191
+    roll: -0.0108695283447
+    pitch: -0.0300925763234
+    yaw: -3.1079901671
+
+  # Production ChArUco result expressed in the same world frame as l and m.
+  r:
+    model: RM65-B
+    namespace: r
+    frame_prefix: r/
+    parent_frame: world
+    x: -1.00176934136
+    y: 0.356032898913
+    z: -0.005193665214
+    roll: -0.0264609215657
+    pitch: -0.00812680208536
+    yaw: -0.00848201144029
+
+# Shared launch behavior. Keep these values here so a deployment can change
+# initial joint posture or the RViz display without editing Python launch code.
+settings:
+  default_joint_position: 0.0
+  rviz_config: three_robots.rviz
+
+# Shared pedestal (底座) the three arm bases stand on. Visual only: it is drawn by the documentation
+# site's 3D viewers and the :8765 Web console, and is not part of TF. An axis-aligned box in
+# `frame` (world). The footprint covers the three bases; the top is the m base plane and the
+# bottom is the work-table plane, derived from the right arm's grasp poses on 2026-10-19
+# (gripper tip at the grasp minus 3 cm). An approximation, not a measured drawing.
+# Keys deliberately avoid x/y/z/roll/pitch/yaw: the calibration write-back
+# (realman_camera_calibration/layout_update.py) rewrites those names in every line after `r:`.
+pedestal:
+  frame: world
+  center_xy: [-0.981, 0.195]
+  size_xy: [0.36, 0.62]
+  top_z: -0.019
+  bottom_z: -0.206
+  color: "#e9edf1"

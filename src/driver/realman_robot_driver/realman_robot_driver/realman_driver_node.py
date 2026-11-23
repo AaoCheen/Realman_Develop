@@ -1,0 +1,1464 @@
+"""ROS 2 joint-state driver for one namespaced RealMan arm."""
+
+from __future__ import annotations
+
+import math
+import json
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+from ament_index_python.packages import get_package_share_directory
+import rclpy
+from rclpy.action import ActionServer
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
+from rclpy.node import Node
+from rclpy.qos import (
+    QoSDurabilityPolicy,
+    QoSHistoryPolicy,
+    QoSProfile,
+    QoSReliabilityPolicy,
+)
+from geometry_msgs.msg import PoseStamped, TwistStamped
+from realman_msgs.action import CartesianPose, CartesianVelocity, ExecuteMotion, ExecuteTrajectory
+from realman_msgs.msg import CartesianVelocityState
+from realman_msgs.srv import (
+    ForwardKinematics,
+    GetCurrentPose,
+    RecoverMotion,
+    SelectFrame,
+    SolveIk,
+    VerifyCoordinates,
+)
+from sensor_msgs.msg import JointState
+from std_msgs.msg import Bool, String
+from std_srvs.srv import Trigger
+
+from .coordinate_manager import CoordinateManager
+from .coordinate_services import (
+    CoordinateOperation,
+    CoordinateOperationResult,
+    run_coordinate_operation,
+    run_startup_coordinate_policy,
+)
+from .cartesian_velocity_session import CartesianVelocitySession
+from .cartesian_pose_session import CartesianPoseSession
+from .cartesian_velocity_telemetry import PoseVelocityEstimator, PoseVelocitySample
+from .motion_coordinator import ArmOwnership, MotionCoordinator
+from .motion_types import MotionSettings, ReferenceState, ReferenceType
+from .pose_math import (
+    euler_to_quaternion,
+    pose_from_reference,
+    pose_to_reference,
+    quaternion_to_euler,
+)
+from .realman_sdk_adapter import RealManSdkAdapter, RobotState
+
+
+_ARMS = frozenset({"l", "m", "r"})
+
+
+def _unpack_frame_result(result: Any) -> tuple[int, Any | None]:
+    if isinstance(result, (tuple, list)) and len(result) >= 2:
+        return int(result[0]), result[1]
+    return int(result), None
+
+
+def _arm_from_namespace(namespace: str) -> str:
+    parts = [part for part in namespace.split("/") if part]
+    if len(parts) != 1 or parts[0] not in _ARMS:
+        raise ValueError("node namespace must be exactly /l, /m, or /r")
+    return parts[0]
+
+
+def _config_path(filename: str) -> str:
+    try:
+        package_path = Path(get_package_share_directory("realman_robot_driver"))
+        installed = package_path / "config" / "ros" / filename
+        if installed.exists():
+            return str(installed)
+    except (KeyError, RuntimeError):
+        pass
+    source_root = Path(__file__).resolve().parents[4]
+    return str(source_root / "config" / "ros" / filename)
+
+
+class RealManDriverNode(Node):
+    """Expose a small, safe ROS contract while SDK features are added."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__("realman_driver", **kwargs)
+        self.arm_id = _arm_from_namespace(self.get_namespace())
+        self.robot_model = self.declare_parameter("robot_model", "RM65-B").value
+        self.robot_ip = self.declare_parameter("robot_ip", "").value
+        self.robot_port = int(self.declare_parameter("robot_port", 8080).value)
+        self.thread_mode = self.declare_parameter("thread_mode", "RM_TRIPLE_MODE_E").value
+        self.mock_mode = bool(self.declare_parameter("mock_mode", False).value)
+        self.auto_connect = bool(self.declare_parameter("auto_connect", True).value)
+        self.reconnect_interval = float(
+            self.declare_parameter("reconnect_interval", 5.0).value
+        )
+        self.state_publish_rate = float(self.declare_parameter("state_publish_rate", 10.0).value)
+        # Publish the joint currents (mA, JointState.effort) on joint_currents with every joint
+        # state. One more SDK read per state tick; it shares the SDK lock with velocity commands.
+        self.publish_joint_currents = bool(
+            self.declare_parameter("publish_joint_currents", True).value
+        )
+        # Diagnostic only: log joint angles around each velocity-session start.
+        self.velocity_start_trace = bool(
+            self.declare_parameter("velocity_start_trace", False).value
+        )
+        # Refresh the controller's stale velocity-passthrough target before ordinary motion (see
+        # CartesianVelocitySession.prepare_for_ordinary_motion). Bench-tested on the real arms:
+        # only "canfd_current" stops the next session being pulled back to the previous end pose;
+        # off/init_zero_stop/stop/delete_current/delete_all all still pull.
+        self.passthrough_reanchor_mode = str(
+            self.declare_parameter("passthrough_reanchor_mode", "canfd_current").value
+        )
+        self.velocity_init_settle_ms = float(
+            self.declare_parameter("velocity_init_settle_ms", 0.0).value
+        )
+        self.coordinate_state_publish_rate = float(
+            self.declare_parameter("coordinate_state_publish_rate", 1.0).value
+        )
+        self.coordinates_config_file = str(
+            self.declare_parameter(
+                "coordinates_config_file", _config_path("realman_coordinates.yaml")
+            ).value
+        )
+        self.motion_config_file = str(
+            self.declare_parameter(
+                "motion_config_file", _config_path("realman_motion.yaml")
+            ).value
+        )
+        self.joint_names = list(
+            self.declare_parameter(
+                "joint_names",
+                [f"joint_{index}" for index in range(1, 7)],
+            ).value
+        )
+        if not self.robot_ip:
+            raise ValueError("robot_ip must be supplied by the root config/ros YAML")
+        if self.robot_port < 1 or self.robot_port > 65535:
+            raise ValueError("robot_port must be between 1 and 65535")
+        if self.thread_mode not in {"RM_SINGLE_MODE_E", "RM_DUAL_MODE_E", "RM_TRIPLE_MODE_E"}:
+            raise ValueError("thread_mode must be a documented rm_thread_mode_e name")
+        if self.thread_mode != "RM_TRIPLE_MODE_E":
+            raise ValueError(
+                "ordinary motion actions require RM_TRIPLE_MODE_E for SDK event callbacks"
+            )
+        if self.state_publish_rate <= 0.0:
+            raise ValueError("state_publish_rate must be positive")
+        if self.coordinate_state_publish_rate <= 0.0:
+            raise ValueError("coordinate_state_publish_rate must be positive")
+        if self.reconnect_interval < 0.0:
+            raise ValueError("reconnect_interval must not be negative")
+        if not self.joint_names or any(not isinstance(name, str) or not name for name in self.joint_names):
+            raise ValueError("joint_names must be a non-empty list of non-empty strings")
+
+        self.arm_ownership = ArmOwnership()
+        self.coordinate_manager = CoordinateManager.from_yaml(
+            self.coordinates_config_file,
+            is_arm_busy=self.arm_ownership.is_busy,
+            acquire_arm=self.arm_ownership.acquire,
+            release_arm=self.arm_ownership.release,
+        )
+        self.motion_settings = MotionSettings.from_yaml(
+            self.motion_config_file,
+            self.arm_id,
+        )
+        self._event_recovery_lock = threading.Lock()
+        self._last_event_recovery_attempt = 0.0
+        self._event_recovery_delay_sec = 1.0
+        self._event_recovery_retry_interval_sec = 1.0
+        profile = self.coordinate_manager.profiles[self.arm_id]
+        self._active_references = {
+            ReferenceType.BASE: "base",
+            ReferenceType.WORK: profile.works[profile.work_default].controller_name,
+            ReferenceType.TOOL: profile.tools[profile.tool_default].controller_name,
+        }
+        self.adapter = RealManSdkAdapter(
+            ip=self.robot_ip,
+            port=self.robot_port,
+            thread_mode=self.thread_mode,
+            robot_model=self.robot_model,
+            mock_mode=self.mock_mode,
+            arm_id=self.arm_id,
+        )
+        if self.mock_mode:
+            self.adapter.configure_mock_coordinate_profile(profile)
+        self.motion_callback_group = ReentrantCallbackGroup()
+        self.motion_coordinator = MotionCoordinator(
+            arm_id=self.arm_id,
+            adapter=self.adapter,
+            coordinate_manager=self.coordinate_manager,
+            ownership=self.arm_ownership,
+            reference_resolver=ReferenceState(
+                {
+                    ReferenceType.BASE: frozenset({"base"}),
+                    ReferenceType.WORK: frozenset(
+                        frame.controller_name for frame in profile.works.values()
+                    ),
+                    ReferenceType.TOOL: frozenset(
+                        frame.controller_name for frame in profile.tools.values()
+                    ),
+                }
+            ),
+            active_reference=lambda reference_type: self._active_references[reference_type],
+            action_type=ExecuteMotion,
+            trajectory_action_type=ExecuteTrajectory,
+            recover_event_channel=lambda: self._recover_event_channel(),
+            stop_timeout_sec=self.motion_settings.stop_timeout_sec,
+            joint_goal_tolerance_deg=self.motion_settings.joint_goal_tolerance_deg,
+            logger=self.get_logger(),
+            before_motion=lambda: self.velocity_session.prepare_for_ordinary_motion(),
+        )
+        self._active_velocity_frames = {
+            ReferenceType.BASE: ("base", f"{self.arm_id}/base_link"),
+            ReferenceType.WORK: (
+                profile.works[profile.work_default].controller_name,
+                profile.works[profile.work_default].ros_frame_id,
+            ),
+            ReferenceType.TOOL: (
+                profile.tools[profile.tool_default].controller_name,
+                profile.tools[profile.tool_default].ros_frame_id,
+            ),
+        }
+        self._velocity_estimator = PoseVelocityEstimator(
+            max_sample_gap_sec=max(0.1, 3.0 / self.state_publish_rate)
+        )
+        self.velocity_session = CartesianVelocitySession(
+            arm_id=self.arm_id,
+            adapter=self.adapter,
+            ownership=self.arm_ownership,
+            settings=self.motion_settings,
+            active_frame=self._active_velocity_frames,
+            prepare_reference=self._prepare_velocity_reference,
+            coordinate_manager=self.coordinate_manager,
+            logger=self.get_logger(),
+            action_type=CartesianVelocity,
+            ros_time_now_ns=lambda: self.get_clock().now().nanoseconds,
+            start_trace=self.velocity_start_trace,
+            reanchor_mode=self.passthrough_reanchor_mode,
+            init_settle_ms=self.velocity_init_settle_ms,
+        )
+        try:
+            from .ik_solver import RealManIK
+
+            urdf_path = (
+                Path(get_package_share_directory('rm65_description'))
+                / 'urdf'
+                / f'{self.robot_model}.urdf'
+            )
+            # SDK FK/IK apply the controller's active tool, which startup reconciles
+            # to the configured default (tcpgrip), so the custom IK uses the same TCP.
+            # The pose session re-checks it against SDK FK before trusting it.
+            ik_tool = profile.tools[profile.tool_default]
+            self._ik_solver = RealManIK(
+                str(urdf_path),
+                tool_position=ik_tool.xyz_m,
+                tool_quaternion_wxyz=ik_tool.quaternion_wxyz,
+            )
+            self.get_logger().info(
+                f"Custom CasADi IK ready for Cartesian pose goals with tool "
+                f"{ik_tool.controller_name} {ik_tool.xyz_m}"
+            )
+        except Exception as error:
+            # The pose session falls back to the controller's own IK, so a missing
+            # CasADi/Pinocchio install or URDF only degrades position teleop quality.
+            # Say so loudly: the fallback is otherwise invisible from the outside.
+            self._ik_solver = None
+            self.get_logger().warning(
+                "Custom CasADi IK unavailable, falling back to the RealMan SDK IK "
+                f"for Cartesian pose goals: {type(error).__name__}: {error}"
+            )
+        self.pose_session = CartesianPoseSession(
+            arm_id=self.arm_id,
+            adapter=self.adapter,
+            ownership=self.arm_ownership,
+            settings=self.motion_settings,
+            active_frame={ReferenceType.BASE: ("base", f"{self.arm_id}/base_link")},
+            coordinate_manager=self.coordinate_manager,
+            logger=self.get_logger(),
+            ros_time_now_ns=lambda: self.get_clock().now().nanoseconds,
+            ik_solver=self._ik_solver,
+        )
+        self._coordinate_state_publisher = self.create_publisher(
+            String,
+            f"/{self.arm_id}/coordinates/state",
+            QoSProfile(
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=1,
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+        )
+        self._last_coordinate_result: CoordinateOperationResult | None = None
+        self.velocity_command_callback_group = MutuallyExclusiveCallbackGroup()
+        self.execute_motion_action_server = ActionServer(
+            self,
+            ExecuteMotion,
+            "execute_motion",
+            execute_callback=self.motion_coordinator.execute,
+            goal_callback=self.motion_coordinator.goal_callback,
+            cancel_callback=self.motion_coordinator.cancel_callback,
+            handle_accepted_callback=self.motion_coordinator.accepted_callback,
+            callback_group=self.motion_callback_group,
+        )
+        self.execute_trajectory_action_server = ActionServer(
+            self,
+            ExecuteTrajectory,
+            "execute_trajectory",
+            execute_callback=self.motion_coordinator.execute_trajectory,
+            goal_callback=self.motion_coordinator.trajectory_goal_callback,
+            cancel_callback=self.motion_coordinator.cancel_callback,
+            handle_accepted_callback=self.motion_coordinator.accepted_callback,
+            callback_group=self.motion_callback_group,
+        )
+        self.cartesian_velocity_action_server = ActionServer(
+            self,
+            CartesianVelocity,
+            "cartesian_velocity",
+            execute_callback=self.velocity_session.execute,
+            goal_callback=self.velocity_session.goal_callback,
+            cancel_callback=self.velocity_session.cancel_callback,
+            handle_accepted_callback=self.velocity_session.accepted_callback,
+            callback_group=self.motion_callback_group,
+        )
+        self.cartesian_pose_action_server = ActionServer(
+            self,
+            CartesianPose,
+            "cartesian_pose",
+            execute_callback=self.pose_session.execute,
+            goal_callback=self.pose_session.goal_callback,
+            cancel_callback=self.pose_session.cancel_callback,
+            handle_accepted_callback=self.pose_session.accepted_callback,
+            callback_group=self.motion_callback_group,
+        )
+        self.cartesian_velocity_command_subscription = self.create_subscription(
+            TwistStamped,
+            "cartesian_velocity/command",
+            self._velocity_command,
+            QoSProfile(
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=1,
+                durability=QoSDurabilityPolicy.VOLATILE,
+                # No lifespan here: QoS lifespan keys off wall-clock time, which drifts
+                # between hosts and silently drops valid commands. Staleness is enforced
+                # by the session monotonic watchdog and relative stamp check instead.
+            ),
+            callback_group=self.velocity_command_callback_group,
+        )
+        self.cartesian_pose_command_subscription = self.create_subscription(
+            PoseStamped,
+            "cartesian_pose/command",
+            self._pose_command,
+            QoSProfile(
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=1,
+                durability=QoSDurabilityPolicy.VOLATILE,
+                # No lifespan here: QoS lifespan keys off wall-clock time, which drifts
+                # between hosts and silently drops valid commands. Staleness is enforced
+                # by the session monotonic watchdog and relative stamp check instead.
+            ),
+            callback_group=self.velocity_command_callback_group,
+        )
+        self.joint_state_publisher = self.create_publisher(JointState, "joint_states", 10)
+        self.joint_current_publisher = self.create_publisher(JointState, "joint_currents", 10)
+        self.cartesian_velocity_state_publisher = self.create_publisher(
+            CartesianVelocityState,
+            "cartesian_velocity/state",
+            QoSProfile(
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=10,
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                durability=QoSDurabilityPolicy.VOLATILE,
+            ),
+        )
+        self.connected_publisher = self.create_publisher(Bool, "connected", 10)
+        self._services = [
+            self.create_service(Trigger, "connect", self._connect),
+            self.create_service(Trigger, "disconnect", self._disconnect),
+            self.create_service(Trigger, "stop", self._stop),
+            self.create_service(
+                RecoverMotion,
+                "recover_motion",
+                self._recover_motion,
+            ),
+            self.create_service(Trigger, "status", self._status),
+            self.create_service(Trigger, "controller_info", self._controller_info),
+            self.create_service(
+                VerifyCoordinates,
+                "coordinates/verify",
+                self._verify_coordinates,
+            ),
+            self.create_service(
+                VerifyCoordinates,
+                "coordinates/apply",
+                self._apply_coordinates,
+            ),
+            self.create_service(
+                SelectFrame,
+                "coordinates/select_tool",
+                self._select_tool_frame,
+            ),
+            self.create_service(
+                SelectFrame,
+                "coordinates/select_work",
+                self._select_work_frame,
+            ),
+            self.create_service(GetCurrentPose, "get_current_pose", self._get_current_pose),
+            self.create_service(ForwardKinematics, "forward_kinematics", self._forward_kinematics),
+            self.create_service(SolveIk, "solve_ik", self._solve_ik),
+        ]
+        period = 1.0 / self.state_publish_rate
+        self.state_timer = self.create_timer(period, self._publish_state)
+        self.coordinate_state_timer = self.create_timer(
+            1.0 / self.coordinate_state_publish_rate,
+            self._publish_coordinate_state,
+        )
+        self._last_state_error = 0
+        self._last_joint_count_error = 0
+        self._last_connect_attempt = 0.0
+        self._ever_connected = False
+
+        self.get_logger().info(
+            f"RealMan joint-state driver ready: model={self.robot_model} ip={self.robot_ip} "
+            f"port={self.robot_port} thread_mode={self.thread_mode} mock_mode={self.mock_mode}"
+        )
+        if self.mock_mode:
+            self.get_logger().warn(
+                "mock_mode is enabled; no physical controller connection or motion will occur"
+            )
+        if self.auto_connect:
+            # A controller or SDK can be unavailable during process startup.
+            # Keep the ROS node alive so the state timer can retry later.
+            try:
+                self._connect_to_robot()
+            except Exception as error:
+                self.get_logger().error(
+                    f"Initial RealMan connection attempt failed: {error}"
+                )
+
+    def _connect(self, _request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
+        code = self._connect_to_robot()
+        response.success = code == 0
+        response.message = "connected" if code == 0 else f"connect failed with API2 status {code}"
+        return response
+
+    def _disconnect(
+        self, _request: Trigger.Request, response: Trigger.Response
+    ) -> Trigger.Response:
+        pose_session = getattr(self, "pose_session", None)
+        pose_shutdown_status = pose_session.shutdown() if pose_session is not None else 0
+        velocity_shutdown_status = self.velocity_session.shutdown()
+        motion_shutdown_status = self.motion_coordinator.shutdown()
+        code = self.adapter.disconnect()
+        pose_clear_ok = True
+        velocity_clear_ok = True
+        if code == 0:
+            velocity_clear_ok = (
+                self.velocity_session.clear_lockout_after_disconnect()
+            )
+            self.motion_coordinator.clear_lockout_after_disconnect()
+            pose_clear_ok = (
+                pose_session.clear_lockout_after_disconnect()
+                if pose_session is not None
+                else True
+            )
+        response.success = (
+            velocity_shutdown_status == 0
+            and motion_shutdown_status == 0
+            and code == 0
+            and velocity_clear_ok
+        )
+        response.success = response.success and pose_shutdown_status == 0 and pose_clear_ok
+        failures = []
+        if pose_shutdown_status != 0:
+            failures.append(f"pose shutdown failed with status {pose_shutdown_status}")
+        if velocity_shutdown_status != 0:
+            failures.append(
+                f"velocity shutdown failed with status {velocity_shutdown_status}"
+            )
+        if motion_shutdown_status != 0:
+            failures.append(
+                f"motion shutdown failed with status {motion_shutdown_status}"
+            )
+        if code != 0:
+            failures.append(f"disconnect failed with status {code}")
+        if not velocity_clear_ok:
+            failures.append("velocity lockout cleanup failed after disconnect")
+        if not pose_clear_ok:
+            failures.append("pose lockout cleanup failed after disconnect")
+        if failures:
+            response.message = "; ".join(failures)
+            self.get_logger().error(response.message)
+        else:
+            response.message = "disconnected"
+        return response
+
+    def _stop(self, _request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
+        pose_status = self.pose_session.fast_stop_if_owned()
+        velocity_status = self.velocity_session.fast_stop_if_owned()
+        code = (
+            self.motion_coordinator.fast_stop()
+            if pose_status is None and velocity_status is None
+            else (pose_status if pose_status is not None else velocity_status)
+        )
+        response.success = code == 0
+        response.message = "stop requested" if code == 0 else f"stop failed with status {code}"
+        if code != 0:
+            self.get_logger().error(f"RealMan stop request failed with status {code}")
+        return response
+
+    def _recover_motion(
+        self,
+        _request: RecoverMotion.Request,
+        response: RecoverMotion.Response,
+    ) -> RecoverMotion.Response:
+        """Explicitly rebuild a quarantined SDK event channel after a cancel."""
+        required = self.motion_coordinator.event_channel_recovery_required
+        response.recovered = False
+        if not required:
+            response.success = True
+            response.api2_status = 0
+            response.message = "motion event channel is already ready"
+            return response
+        if self.motion_coordinator.is_busy():
+            response.success = False
+            response.api2_status = -2
+            response.message = "arm is busy; recover_motion refused"
+            return response
+        recovered = False
+        try:
+            recovered = bool(self._recover_event_channel())
+        except Exception as error:
+            self.get_logger().error(f"Explicit motion recovery failed: {error}")
+            response.api2_status = -1
+            response.message = f"motion recovery failed: {error}"
+        if recovered:
+            response.success = True
+            response.recovered = True
+            response.api2_status = 0
+            response.message = "motion event channel recovered"
+        elif not response.message:
+            response.success = False
+            response.api2_status = int(
+                getattr(self.adapter, "last_error", -1) or -1
+            )
+            response.message = "motion event channel recovery failed"
+        return response
+
+    def _status(self, _request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
+        response.success = self.adapter.connected
+        response.message = (
+            f"connected={self.adapter.connected} mock_mode={self.mock_mode} "
+            f"last_error={self.adapter.last_error}"
+        )
+        if self.adapter.last_error_message:
+            response.message += f" detail={self.adapter.last_error_message}"
+        return response
+
+    def _controller_info(
+        self, _request: Trigger.Request, response: Trigger.Response
+    ) -> Trigger.Response:
+        """Return read-only controller version/parameter getters as JSON."""
+        try:
+            info = self.adapter.controller_info()
+            response.success = self.adapter.connected and bool(info)
+            response.message = json.dumps(
+                {"arm": self.arm_id, "robot_ip": self.robot_ip, "info": info},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        except Exception as error:
+            self.get_logger().error(f"RealMan controller info query failed: {error}")
+            response.success = False
+            response.message = json.dumps({"arm": self.arm_id, "error": str(error)})
+        return response
+
+    def _verify_coordinates(
+        self,
+        _request: VerifyCoordinates.Request,
+        response: VerifyCoordinates.Response,
+    ) -> VerifyCoordinates.Response:
+        result = self._run_coordinate_operation(CoordinateOperation.VERIFY)
+        return self._fill_verify_response(response, result)
+
+    def _apply_coordinates(
+        self,
+        _request: VerifyCoordinates.Request,
+        response: VerifyCoordinates.Response,
+    ) -> VerifyCoordinates.Response:
+        result = self._run_coordinate_operation(CoordinateOperation.APPLY)
+        return self._fill_verify_response(response, result)
+
+    def _select_tool_frame(
+        self,
+        request: SelectFrame.Request,
+        response: SelectFrame.Response,
+    ) -> SelectFrame.Response:
+        result = self._run_coordinate_operation(
+            CoordinateOperation.SELECT_TOOL, request.name
+        )
+        return self._fill_select_response(response, result)
+
+    def _select_work_frame(
+        self,
+        request: SelectFrame.Request,
+        response: SelectFrame.Response,
+    ) -> SelectFrame.Response:
+        result = self._run_coordinate_operation(
+            CoordinateOperation.SELECT_WORK, request.name
+        )
+        return self._fill_select_response(response, result)
+
+    def _get_current_pose(
+        self,
+        request: GetCurrentPose.Request,
+        response: GetCurrentPose.Response,
+    ) -> GetCurrentPose.Response:
+        """Read current joints, run FK, and express the pose in the active frame."""
+        try:
+            reference_type, frame = self._kinematics_reference(
+                request.reference_type, request.reference_name
+            )
+            state = self.adapter.get_state()
+            if state.error_code != 0 or not state.joint_degrees:
+                return self._fill_current_pose_response(
+                    response,
+                    False,
+                    state.error_code or -1,
+                    (),
+                    (),
+                    (),
+                    "current joint state is unavailable",
+                )
+            status, base_pose = self.adapter.forward_kinematics(list(state.joint_degrees))
+            if status != 0:
+                return self._fill_current_pose_response(
+                    response, False, status, state.joint_degrees, (), (),
+                    f"forward kinematics failed with API2 status {status}",
+                )
+            position, quaternion = self._pose_in_reference(
+                reference_type, frame, base_pose
+            )
+            return self._fill_current_pose_response(
+                response, True, 0, state.joint_degrees, position, quaternion, "current pose read"
+            )
+        except (TypeError, ValueError) as error:
+            return self._fill_current_pose_response(
+                response, False, -1, (), (), (), str(error)
+            )
+        except Exception as error:
+            self.get_logger().error(f"RealMan current pose service failed: {error}")
+            return self._fill_current_pose_response(
+                response, False, -1, (), (), (), "current pose query failed"
+            )
+
+    def _solve_ik(
+        self,
+        request: SolveIk.Request,
+        response: SolveIk.Response,
+    ) -> SolveIk.Response:
+        """Solve IK for a pose in the active reference without submitting motion."""
+        try:
+            reference_type, frame = self._kinematics_reference(
+                request.reference_type, request.reference_name
+            )
+            seed = [float(value) for value in request.seed_joint_degrees]
+            if len(seed) != 6 or not all(math.isfinite(value) for value in seed):
+                raise ValueError("seed_joint_degrees must contain six finite values")
+            target_quaternion = tuple(float(value) for value in request.pose_quaternion_wxyz)
+            target_position = tuple(float(value) for value in request.pose_position_m)
+            if len(target_position) != 3 or not all(math.isfinite(value) for value in target_position):
+                raise ValueError("pose_position_m must contain three finite values")
+            if len(target_quaternion) != 4 or not all(math.isfinite(value) for value in target_quaternion):
+                raise ValueError("pose_quaternion_wxyz must contain four finite values")
+            base_position, base_quaternion = self._target_in_base(
+                reference_type, frame, target_position, target_quaternion
+            )
+            pose_euler = [
+                *base_position,
+                *quaternion_to_euler(base_quaternion),
+            ]
+            status, joints = self.adapter.inverse_kinematics(seed, pose_euler)
+            if status != 0:
+                response.success = False
+                response.api2_status = status
+                response.message = f"inverse kinematics failed with API2 status {status}"
+                return response
+            if len(joints) != 6 or not all(math.isfinite(value) for value in joints):
+                raise ValueError("SDK returned an invalid six-joint IK solution")
+            response.success = True
+            response.api2_status = 0
+            response.joint_degrees = joints
+            response.message = "inverse kinematics solved; shadow preview only"
+            return response
+        except (TypeError, ValueError) as error:
+            response.success = False
+            response.api2_status = -1
+            response.message = str(error)
+            return response
+        except Exception as error:
+            self.get_logger().error(f"RealMan inverse kinematics service failed: {error}")
+            response.success = False
+            response.api2_status = -1
+            response.message = "inverse kinematics query failed"
+            return response
+
+    def _forward_kinematics(
+        self,
+        request: ForwardKinematics.Request,
+        response: ForwardKinematics.Response,
+    ) -> ForwardKinematics.Response:
+        """Run FK for an arbitrary six-joint target and express it in the active frame."""
+        try:
+            reference_type, frame = self._kinematics_reference(
+                request.reference_type, request.reference_name
+            )
+            joints = [float(value) for value in request.joint_degrees]
+            if len(joints) != 6 or not all(math.isfinite(value) for value in joints):
+                raise ValueError("joint_degrees must contain six finite values")
+            status, base_pose = self.adapter.forward_kinematics(joints)
+            if status != 0:
+                return self._fill_forward_kinematics_response(
+                    response,
+                    False,
+                    status,
+                    (),
+                    (),
+                    f"forward kinematics failed with API2 status {status}",
+                )
+            position, quaternion = self._pose_in_reference(
+                reference_type, frame, base_pose
+            )
+            return self._fill_forward_kinematics_response(
+                response,
+                True,
+                0,
+                position,
+                quaternion,
+                "forward kinematics solved",
+            )
+        except (TypeError, ValueError) as error:
+            return self._fill_forward_kinematics_response(
+                response, False, -1, (), (), str(error)
+            )
+        except Exception as error:
+            self.get_logger().error(f"RealMan forward kinematics service failed: {error}")
+            return self._fill_forward_kinematics_response(
+                response, False, -1, (), (), "forward kinematics query failed"
+            )
+
+    def _kinematics_reference(
+        self, reference_type_value: int, reference_name: str
+    ) -> tuple[ReferenceType, Any | None]:
+        try:
+            reference_type = ReferenceType(int(reference_type_value))
+        except (TypeError, ValueError) as error:
+            raise ValueError("reference_type must be BASE, WORK, or TOOL") from error
+        if not isinstance(reference_name, str) or not reference_name:
+            raise ValueError("reference_name must be non-empty")
+        if reference_type is ReferenceType.BASE:
+            if reference_name != "base":
+                raise ValueError("BASE reference_name must be base")
+            return reference_type, None
+        if not self.coordinate_manager.motion_allowed(self.arm_id):
+            raise ValueError("coordinate verification blocks kinematics")
+        if self._active_references[reference_type] != reference_name:
+            raise ValueError("reference does not match the active controller frame")
+        raw_frame = (
+            self.adapter.current_work_frame()
+            if reference_type is ReferenceType.WORK
+            else self.adapter.current_tool_frame()
+        )
+        status, frame = _unpack_frame_result(raw_frame)
+        if status != 0 or frame is None:
+            raise ValueError(f"active {reference_type.name.lower()} frame is unavailable")
+        return reference_type, frame
+
+    @staticmethod
+    def _pose_in_reference(
+        reference_type: ReferenceType, frame: Any | None, base_pose: list[float]
+    ) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+        base_position = tuple(base_pose[:3])
+        base_quaternion = euler_to_quaternion(*base_pose[3:])
+        if reference_type is ReferenceType.BASE:
+            return base_position, base_quaternion
+        if frame is None:
+            raise ValueError("reference frame is unavailable")
+        return pose_to_reference(
+            base_position,
+            base_quaternion,
+            frame.xyz_m,
+            frame.quaternion_wxyz,
+        )
+
+    @staticmethod
+    def _target_in_base(
+        reference_type: ReferenceType,
+        frame: Any | None,
+        target_position: tuple[float, float, float],
+        target_quaternion: tuple[float, float, float, float],
+    ) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+        if reference_type is ReferenceType.BASE:
+            return target_position, target_quaternion
+        if frame is None:
+            raise ValueError("reference frame is unavailable")
+        return pose_from_reference(
+            frame.xyz_m,
+            frame.quaternion_wxyz,
+            target_position,
+            target_quaternion,
+        )
+
+    @staticmethod
+    def _fill_current_pose_response(
+        response: GetCurrentPose.Response,
+        success: bool,
+        status: int,
+        joints: Any,
+        position: Any,
+        quaternion: Any,
+        message: str,
+    ) -> GetCurrentPose.Response:
+        response.success = success
+        response.api2_status = int(status)
+        if len(joints) == 6:
+            response.current_joint_degrees = list(joints)
+        if len(position) == 3:
+            response.pose_position_m = list(position)
+        if len(quaternion) == 4:
+            response.pose_quaternion_wxyz = list(quaternion)
+        response.message = message
+        return response
+
+    @staticmethod
+    def _fill_forward_kinematics_response(
+        response: ForwardKinematics.Response,
+        success: bool,
+        status: int,
+        position: Any,
+        quaternion: Any,
+        message: str,
+    ) -> ForwardKinematics.Response:
+        response.success = success
+        response.api2_status = int(status)
+        if len(position) == 3:
+            response.pose_position_m = list(position)
+        if len(quaternion) == 4:
+            response.pose_quaternion_wxyz = list(quaternion)
+        response.message = message
+        return response
+
+    def _run_coordinate_operation(
+        self,
+        operation: CoordinateOperation,
+        name: str = "",
+        *,
+        ownership_already_acquired: bool = False,
+    ) -> CoordinateOperationResult:
+        result = run_coordinate_operation(
+            self.coordinate_manager,
+            self.adapter,
+            self.arm_ownership,
+            self.arm_id,
+            operation,
+            name,
+            publish_result=self._update_active_references,
+            ownership_already_acquired=ownership_already_acquired,
+        )
+        if not result.success or not result.matched:
+            self.get_logger().warn(
+                f"RealMan coordinate {operation} did not establish a full match: "
+                f"{result.message}"
+            )
+        else:
+            self.get_logger().info(
+                f"RealMan coordinate {operation} succeeded: {result.message}"
+            )
+        self._publish_coordinate_state(result)
+        return result
+
+    def _update_active_references(self, result: CoordinateOperationResult) -> None:
+        if result.current_tool:
+            self._active_references[ReferenceType.TOOL] = result.current_tool
+            frame = self._frame_for_controller(ReferenceType.TOOL, result.current_tool)
+            if frame is not None:
+                self._active_velocity_frames[ReferenceType.TOOL] = frame
+        if result.current_work:
+            self._active_references[ReferenceType.WORK] = result.current_work
+            frame = self._frame_for_controller(ReferenceType.WORK, result.current_work)
+            if frame is not None:
+                self._active_velocity_frames[ReferenceType.WORK] = frame
+
+    def _prepare_velocity_reference(
+        self, reference_type: ReferenceType, reference_name: str
+    ) -> None:
+        """Select and verify a configured work frame before velocity startup."""
+        if reference_type is not ReferenceType.WORK:
+            return
+        active_work = self._active_velocity_frames.get(ReferenceType.WORK)
+        if (
+            active_work is not None
+            and active_work[0] == reference_name
+            and self.coordinate_manager.motion_allowed(self.arm_id)
+        ):
+            return
+        result = self._run_coordinate_operation(
+            CoordinateOperation.SELECT_WORK,
+            reference_name,
+            ownership_already_acquired=True,
+        )
+        if not result.success or not result.matched:
+            raise ValueError(
+                f"unable to select and verify work frame {reference_name!r}: "
+                f"{result.message}"
+            )
+
+    def _publish_coordinate_state(
+        self, result: CoordinateOperationResult | None = None
+    ) -> None:
+        if result is not None:
+            self._last_coordinate_result = result
+        else:
+            result = self._last_coordinate_result
+        profile = self.coordinate_manager.profiles[self.arm_id]
+        motion_allowed = bool(self.coordinate_manager.motion_allowed(self.arm_id))
+        tool_name = result.current_tool if result and result.current_tool else self._active_references[ReferenceType.TOOL]
+        work_name = result.current_work if result and result.current_work else self._active_references[ReferenceType.WORK]
+        tool_frame = self._frame_for_controller(ReferenceType.TOOL, tool_name)
+        work_frame = self._frame_for_controller(ReferenceType.WORK, work_name)
+        payload = {
+            "type": "coordinate_state",
+            "arm": self.arm_id,
+            "motion_allowed": motion_allowed,
+            "preferred_reference_type": int(
+                ReferenceType.WORK if work_frame is not None else ReferenceType.TOOL if tool_frame is not None else ReferenceType.BASE
+            ),
+            "preferred_reference_name": work_name if work_frame is not None else tool_name if tool_frame is not None else "base",
+            "preferred_reference": self._frame_payload(
+                ReferenceType.WORK if work_frame is not None else ReferenceType.TOOL if tool_frame is not None else ReferenceType.BASE,
+                work_name if work_frame is not None else tool_name if tool_frame is not None else "base",
+                work_frame if work_frame is not None else tool_frame,
+            ),
+            "tool": self._frame_payload(ReferenceType.TOOL, tool_name, tool_frame),
+            "work": self._frame_payload(ReferenceType.WORK, work_name, work_frame),
+            "current_tool": tool_name,
+            "current_work": work_name,
+            "expected_tool": result.expected_tool if result else profile.tool_default,
+            "expected_work": result.expected_work if result else profile.work_default,
+            "matched": result.matched if result else motion_allowed,
+            "tool_matched": result.tool_matched if result else tool_frame is not None,
+            "work_matched": result.work_matched if result else work_frame is not None,
+            "api2_status": result.api2_status if result else 0,
+            "message": result.message if result else "",
+        }
+        message = String()
+        message.data = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+        self._coordinate_state_publisher.publish(message)
+
+    def _frame_for_controller(
+        self, reference_type: ReferenceType, controller_name: str
+    ) -> tuple[str, str] | None:
+        profile = self.coordinate_manager.profiles[self.arm_id]
+        frames = profile.tools if reference_type == ReferenceType.TOOL else profile.works
+        for frame in frames.values():
+            if frame.controller_name == controller_name:
+                return frame.controller_name, frame.ros_frame_id
+        return None
+
+    def _frame_payload(
+        self,
+        reference_type: ReferenceType,
+        controller_name: str,
+        frame: tuple[str, str] | None,
+    ) -> dict[str, Any] | None:
+        if reference_type is ReferenceType.BASE:
+            return {
+                "type": int(reference_type),
+                "name": controller_name,
+                "frame_id": f"{self.arm_id}/base_link",
+            }
+        profile = self.coordinate_manager.profiles[self.arm_id]
+        frames = profile.tools if reference_type is ReferenceType.TOOL else profile.works
+        for candidate in frames.values():
+            if candidate.controller_name != controller_name:
+                continue
+            payload = {
+                "type": int(reference_type),
+                "name": candidate.controller_name,
+                "frame_id": candidate.ros_frame_id,
+                "controller_name": candidate.controller_name,
+                "xyz_m": list(candidate.xyz_m),
+                "quaternion_wxyz": list(candidate.quaternion_wxyz),
+            }
+            if reference_type is ReferenceType.TOOL:
+                payload["payload_kg"] = candidate.payload_kg
+                payload["center_of_mass_m"] = list(candidate.center_of_mass_m)
+            return payload
+        if frame is None:
+            return None
+        return {
+            "type": int(reference_type),
+            "name": controller_name,
+            "frame_id": frame[1],
+        }
+
+    def _velocity_command(self, command: TwistStamped) -> None:
+        try:
+            stamp = getattr(getattr(command, "header", None), "stamp", None)
+            if stamp is None or (stamp.sec == 0 and stamp.nanosec == 0):
+                raise ValueError("TwistStamped header.stamp must be set")
+            self.velocity_session.accept_command(command)
+        except (RuntimeError, ValueError) as error:
+            # Commands arrive at the router's control rate (100 Hz), so a rejected
+            # stream would otherwise log once per message.
+            self.get_logger().warning(
+                f"Cartesian velocity command rejected: {error}",
+                throttle_duration_sec=1.0,
+            )
+
+    def _pose_command(self, command: PoseStamped) -> None:
+        try:
+            stamp = getattr(getattr(command, "header", None), "stamp", None)
+            if stamp is None or (stamp.sec == 0 and stamp.nanosec == 0):
+                raise ValueError("PoseStamped header.stamp must be set")
+            self.pose_session.accept_command(command)
+        except (RuntimeError, ValueError) as error:
+            self.get_logger().warning(f"Cartesian pose command rejected: {error}")
+
+    @staticmethod
+    def _fill_verify_response(
+        response: VerifyCoordinates.Response,
+        result: CoordinateOperationResult,
+    ) -> VerifyCoordinates.Response:
+        response.success = result.success
+        response.matched = result.matched
+        response.api2_status = result.api2_status
+        response.message = result.message
+        return response
+
+    @staticmethod
+    def _fill_select_response(
+        response: SelectFrame.Response,
+        result: CoordinateOperationResult,
+    ) -> SelectFrame.Response:
+        response.success = result.success
+        response.api2_status = result.api2_status
+        response.active_name = result.active_name
+        response.message = result.message
+        return response
+
+    def _connect_to_robot(self, *, event_recovery: bool = False) -> int:
+        self._last_connect_attempt = time.monotonic()
+        try:
+            was_connected = self.adapter.connected
+            if event_recovery:
+                code = self.adapter.reconnect()
+            else:
+                code = self.adapter.connect()
+            if code == 0:
+                if event_recovery:
+                    # A clean stop can leave the controller reporting an active
+                    # trajectory even though nothing is moving. Clear it before the
+                    # reconcile read, otherwise the channel stays quarantined.
+                    stop_status = int(self.adapter.stop())
+                    if stop_status != 0:
+                        self.get_logger().warn(
+                            "RealMan trajectory stop before recovery returned API2 "
+                            f"status {stop_status}"
+                        )
+                    else:
+                        time.sleep(0.3)
+                callback_status = self.adapter.register_event_callback(
+                    self.motion_coordinator.handle_event
+                )
+                if callback_status != 0:
+                    self.get_logger().error(
+                        "RealMan event callback registration failed with API2 status "
+                        f"{callback_status}"
+                    )
+                    self.adapter.disconnect()
+                    return callback_status
+                if (
+                    not event_recovery
+                    and not was_connected
+                    and getattr(self, "_ever_connected", False)
+                ):
+                    # The link dropped under us. A session that was running then
+                    # could not stop on the dead handle, so it kept ownership in
+                    # lockout; without this the arm stays busy until restart.
+                    release_status = self._release_lockouts_after_lost_link()
+                    if release_status != 0:
+                        self.adapter.disconnect()
+                        return release_status
+                # Recovery recreates the SDK handle while the adapter still
+                # reports connected, but the callback channel is just as fresh
+                # as after a cold connect. Without the reset flag the
+                # quarantine is never cleared and every motion goal is rejected.
+                if not self.motion_coordinator.reconcile_after_connect(
+                    connection_reset=event_recovery or not was_connected,
+                    recovery_owns_arm=event_recovery,
+                ):
+                    self.get_logger().warn(
+                        "RealMan trajectory reconciliation did not prove an inactive, "
+                        "error-free trajectory; motion remains safety gated"
+                    )
+                if not event_recovery:
+                    verification = run_startup_coordinate_policy(
+                        self.coordinate_manager,
+                        self.adapter,
+                        self.arm_ownership,
+                        self.arm_id,
+                        publish_result=self._update_active_references,
+                        ownership_already_acquired=event_recovery,
+                    )
+                    if verification.api2_status != 0:
+                        self.get_logger().error(
+                            "RealMan coordinate startup failed with API2 status "
+                            f"{verification.api2_status}: {verification.message}"
+                        )
+                        # Stay retryable: a connected adapter is never retried
+                        # by the reconnect timer.
+                        self.adapter.disconnect()
+                        return verification.api2_status
+                    if not verification.matched:
+                        self.get_logger().warn(
+                            f"RealMan coordinate verification blocked motion: {verification.message}"
+                        )
+                    self._publish_coordinate_state(verification)
+                self._ever_connected = True
+                self.get_logger().info("RealMan connection ready")
+            else:
+                detail = self.adapter.last_error_message or "no SDK detail"
+                self.get_logger().error(
+                    f"RealMan connection failed with API2 status {code}: {detail}"
+                )
+            return code
+        except Exception as error:
+            self.get_logger().error(f"RealMan connection setup failed: {error}")
+            try:
+                self.adapter.disconnect()
+            except Exception as disconnect_error:
+                self.get_logger().error(
+                    f"RealMan connection cleanup failed: {disconnect_error}"
+                )
+            return -1
+
+    def _release_lockouts_after_lost_link(self) -> int:
+        """Stop on the fresh handle, then drop lockouts the dead handle left behind.
+
+        Same release as an explicit /disconnect + /connect, gated on a stop the
+        controller acknowledges on the new connection.
+        """
+        try:
+            stop_status = int(self.adapter.stop())
+        except Exception as error:
+            self.get_logger().error(f"RealMan stop after lost link failed: {error}")
+            return -1
+        if stop_status != 0:
+            self.get_logger().error(
+                "RealMan stop after lost link returned API2 status "
+                f"{stop_status}; session lockouts are kept and the connect is retried"
+            )
+            return stop_status
+        velocity_clear_ok = self.velocity_session.clear_lockout_after_disconnect()
+        pose_clear_ok = self.pose_session.clear_lockout_after_disconnect()
+        self.motion_coordinator.clear_lockout_after_disconnect()
+        if not velocity_clear_ok or not pose_clear_ok:
+            self.get_logger().warn(
+                "RealMan session lockout after lost link not released yet "
+                f"(velocity={velocity_clear_ok} pose={pose_clear_ok})"
+            )
+        else:
+            self.get_logger().warn(
+                "RealMan link was lost; stopped on the new connection and released "
+                "session lockouts"
+            )
+        return 0
+
+    def _recover_event_channel(self) -> bool:
+        """Reset a stale callback channel after a confirmed inactive stop."""
+        if not self.motion_coordinator.event_channel_recovery_required:
+            return True
+        if not self._event_recovery_lock.acquire(blocking=False):
+            return False
+        owns_arm = False
+        try:
+            now = time.monotonic()
+            if (
+                now - self._last_event_recovery_attempt
+                < self._event_recovery_retry_interval_sec
+            ):
+                return False
+            self._last_event_recovery_attempt = now
+            owns_arm = self.arm_ownership.acquire(self.arm_id)
+            if not owns_arm:
+                self.get_logger().warn(
+                    f"Motion event channel recovery refused: arm {self.arm_id} is busy"
+                )
+                return False
+            if not self.motion_coordinator.event_channel_recovery_required:
+                return True
+            self.get_logger().warn(
+                "Resetting RealMan SDK connection after a clean stop left the "
+                "trajectory event channel without a generation marker"
+            )
+            # The controller can keep the old TCP session briefly after the
+            # SDK handle is destroyed. Give it a bounded quiet interval before
+            # creating a replacement handle.
+            time.sleep(self._event_recovery_delay_sec)
+            if not self.motion_coordinator.event_channel_recovery_required:
+                return True
+            connect_status = self._connect_to_robot(event_recovery=True)
+            if connect_status != 0:
+                self.get_logger().error(
+                    "RealMan event channel reset reconnect failed with API2 "
+                    f"status {connect_status}"
+                )
+                return False
+            return not self.motion_coordinator.event_channel_recovery_required
+        finally:
+            if owns_arm:
+                self.arm_ownership.release(self.arm_id)
+            self._event_recovery_lock.release()
+
+    def _maybe_reconnect(self) -> None:
+        """Keep one arm retryable without ever bypassing motion safety gates."""
+        if not self.auto_connect or self.reconnect_interval <= 0.0:
+            return
+        now = time.monotonic()
+        try:
+            if self.motion_coordinator.event_channel_recovery_required:
+                if (
+                    now - self._last_event_recovery_attempt
+                    >= self.reconnect_interval
+                ):
+                    self._recover_event_channel()
+                return
+            if (
+                not self.adapter.connected
+                and now - self._last_connect_attempt >= self.reconnect_interval
+            ):
+                self._connect_to_robot()
+        except Exception as error:
+            self.get_logger().error(f"Automatic RealMan reconnect failed: {error}")
+
+    def _publish_joint_currents(self, stamp: Any) -> None:
+        """Publish the joint currents (mA in effort) next to a joint state; skip when unreadable."""
+        if not getattr(self, "publish_joint_currents", False):
+            return
+        read = getattr(self.adapter, "joint_currents", None)
+        if not callable(read):
+            return
+        try:
+            currents = read()
+        except Exception:
+            return
+        if not currents or len(currents) != len(self.joint_names):
+            return
+        message = JointState()
+        message.header.stamp = stamp
+        message.name = list(self.joint_names)
+        message.effort = [float(value) for value in currents]
+        self.joint_current_publisher.publish(message)
+
+    def _publish_state(self) -> None:
+        self._maybe_reconnect()
+
+        now = self.get_clock().now()
+        stamp_ns = now.nanoseconds
+
+        try:
+            state = self.adapter.get_state()
+        except Exception as error:
+            # A vendor exception must not escape a ROS timer callback. Tear down
+            # the possibly stale handle so the next timer tick can reconnect.
+            self.get_logger().error(f"RealMan state read failed: {error}")
+            try:
+                self.adapter.disconnect()
+            except Exception as disconnect_error:
+                self.get_logger().error(
+                    f"RealMan state recovery cleanup failed: {disconnect_error}"
+                )
+            state = RobotState((), False, self.robot_model, -1)
+        connected = Bool()
+        connected.data = state.connected
+        self.connected_publisher.publish(connected)
+        if not state.connected or state.error_code != 0 or not state.joint_degrees:
+            estimator = getattr(self, "_velocity_estimator", None)
+            if estimator is not None:
+                estimator.reset()
+                self._publish_cartesian_velocity_state(
+                    now.to_msg(), estimator.latest(stamp_ns)
+                )
+            self._report_state_error(state)
+            return
+
+        message = JointState()
+        message.header.stamp = self.get_clock().now().to_msg()
+        if len(state.joint_degrees) != len(self.joint_names):
+            joint_count = len(state.joint_degrees)
+            if joint_count != self._last_joint_count_error:
+                self._last_joint_count_error = joint_count
+                self.get_logger().warn(
+                    f"Ignoring joint state with {joint_count} joints; "
+                    f"configuration expects {len(self.joint_names)}"
+                )
+            estimator = getattr(self, "_velocity_estimator", None)
+            if estimator is not None:
+                estimator.reset()
+                self._publish_cartesian_velocity_state(
+                    now.to_msg(), estimator.latest(stamp_ns)
+                )
+            return
+        self._last_joint_count_error = 0
+        message.name = self.joint_names
+        # The vendor API reports degrees; sensor_msgs/JointState requires radians.
+        message.position = [math.radians(float(value)) for value in state.joint_degrees]
+        self.joint_state_publisher.publish(message)
+        self._publish_joint_currents(message.header.stamp)
+        estimator = getattr(self, "_velocity_estimator", None)
+        if estimator is not None:
+            fk = getattr(self.adapter, "forward_kinematics", None)
+            if not callable(fk):
+                estimator.reset()
+                measured = estimator.latest(stamp_ns)
+            else:
+                try:
+                    fk_status, base_pose = fk(list(state.joint_degrees))
+                except Exception as error:
+                    self.get_logger().debug(
+                        f"RealMan FK state read failed for velocity telemetry: {error}"
+                    )
+                    estimator.reset()
+                    measured = estimator.latest(stamp_ns)
+                else:
+                    if fk_status == 0:
+                        estimator.update(stamp_ns, base_pose)
+                        measured = estimator.latest(stamp_ns)
+                    else:
+                        self.get_logger().debug(
+                            "RealMan FK state read failed for velocity telemetry "
+                            f"with API2 status {fk_status}"
+                        )
+                        estimator.reset()
+                        measured = estimator.latest(stamp_ns)
+            self._publish_cartesian_velocity_state(now.to_msg(), measured)
+        self._report_state_error(state)
+
+    def _publish_cartesian_velocity_state(
+        self, stamp: Any, measured: PoseVelocitySample
+    ) -> None:
+        publisher = getattr(self, "cartesian_velocity_state_publisher", None)
+        if publisher is None:
+            return
+        state = self.velocity_session.telemetry_snapshot()
+        message = CartesianVelocityState()
+        message.header.stamp = stamp
+        message.header.frame_id = f"{self.arm_id}/base_link"
+        message.session_active = state.session_active
+        message.reference_type = state.reference_type
+        message.reference_name = state.reference_name
+        message.command_frame_id = state.frame_id
+        message.commanded_linear_velocity_mps = list(state.commanded[:3])
+        message.commanded_angular_velocity_radps = list(state.commanded[3:])
+        message.limited_linear_velocity_mps = list(state.limited[:3])
+        message.limited_angular_velocity_radps = list(state.limited[3:])
+        message.measured_frame_id = f"{self.arm_id}/base_link"
+        message.measured_linear_velocity_mps = list(measured.linear_mps)
+        message.measured_angular_velocity_radps = list(measured.angular_radps)
+        message.measured_valid = measured.valid
+        message.command_age_ms = state.command_age_ms
+        message.measured_age_ms = measured.age_ms
+        publisher.publish(message)
+
+    def _report_state_error(self, state: RobotState) -> None:
+        if state.error_code == self._last_state_error:
+            return
+        self._last_state_error = state.error_code
+        if state.error_code != 0:
+            self.get_logger().warn(
+                f"RealMan state unavailable or returned status {state.error_code}"
+            )
+        else:
+            self.get_logger().info("RealMan state stream recovered")
+
+    def destroy_node(self) -> bool:
+        pose_status = self.pose_session.shutdown()
+        if pose_status != 0:
+            self.get_logger().error(
+                f"RealMan Cartesian pose shutdown failed with status {pose_status}"
+            )
+        velocity_status = self.velocity_session.shutdown()
+        if velocity_status != 0:
+            self.get_logger().error(
+                f"RealMan Cartesian velocity shutdown failed with status {velocity_status}"
+            )
+        shutdown_status = self.motion_coordinator.shutdown()
+        if shutdown_status != 0:
+            self.get_logger().error(
+                f"RealMan shutdown failed with status {shutdown_status}; "
+                "physical safety lockout is retained"
+            )
+        if self.execute_motion_action_server is not None:
+            self.execute_motion_action_server.destroy()
+        if self.execute_trajectory_action_server is not None:
+            self.execute_trajectory_action_server.destroy()
+        if self.cartesian_velocity_action_server is not None:
+            self.cartesian_velocity_action_server.destroy()
+        if self.cartesian_pose_action_server is not None:
+            self.cartesian_pose_action_server.destroy()
+        if self.adapter.disconnect() == 0:
+            velocity_clear_ok = (
+                self.velocity_session.clear_lockout_after_disconnect()
+            )
+            self.motion_coordinator.clear_lockout_after_disconnect()
+            pose_clear_ok = self.pose_session.clear_lockout_after_disconnect()
+            if not velocity_clear_ok:
+                self.get_logger().error(
+                    "RealMan velocity lockout cleanup failed after disconnect"
+                )
+            if not pose_clear_ok:
+                self.get_logger().error(
+                    "RealMan pose lockout cleanup failed after disconnect"
+                )
+        # disconnect() only releases this arm's handle so a running node can
+        # reconnect. The SDK-wide rm_destroy() runs once, as the process exits.
+        shutdown_sdk_status = self.adapter.shutdown()
+        if shutdown_sdk_status != 0:
+            self.get_logger().error(
+                f"RealMan SDK shutdown failed with status {shutdown_sdk_status}"
+            )
+        return super().destroy_node()
+
+
+def main(args: Any = None) -> None:
+    rclpy.init(args=args)
+    node = RealManDriverNode()
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+    try:
+        executor.spin()
+    except (KeyboardInterrupt, ExternalShutdownException):
+        if rclpy.ok():
+            node.get_logger().info("RealMan driver shutdown requested")
+    finally:
+        try:
+            node.pose_session.shutdown()
+            node.velocity_session.shutdown()
+            node.motion_coordinator.shutdown()
+            executor.shutdown()
+            node.destroy_node()
+        except (KeyboardInterrupt, ExternalShutdownException):
+            pass
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

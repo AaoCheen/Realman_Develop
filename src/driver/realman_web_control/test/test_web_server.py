@@ -1,0 +1,236 @@
+import asyncio
+import json
+from pathlib import Path
+
+import pytest
+import yaml
+from aiohttp import web
+
+from realman_web_control.web_server import WebControlServer, WebServerConfig, load_server_config
+
+
+def test_input_mode_timing_is_loaded_from_root_config_without_runtime_defaults(tmp_path):
+    config_file = Path(__file__).resolve().parents[4] / "config/ros/realman_web_control.yaml"
+    document = yaml.safe_load(config_file.read_text())
+    document["input_mode"] = {"discovery_period_sec": 0.75, "web_override_timeout_sec": 2.5}
+    path = tmp_path / "web.yaml"
+    path.write_text(yaml.safe_dump(document))
+    config = load_server_config(path)
+    assert config.discovery_period_sec == 0.75
+    assert config.web_override_timeout_sec == 2.5
+
+
+@pytest.mark.parametrize("field", ["discovery_period_sec", "web_override_timeout_sec"])
+@pytest.mark.parametrize("value", [None, 0, -1, float("nan"), float("inf"), True, "1.0"])
+def test_input_mode_timing_rejects_missing_nonfinite_and_nonpositive_values(tmp_path, field, value):
+    document = {"server": {"bind_host": "127.0.0.1", "allowed_origins": ["same-origin"]},
+                "input_mode": {"discovery_period_sec": 1.0, "web_override_timeout_sec": 5.0}}
+    if value is None:
+        del document["input_mode"][field]
+    else:
+        document["input_mode"][field] = value
+    path = tmp_path / "web.yaml"
+    path.write_text(yaml.safe_dump(document))
+    with pytest.raises(ValueError, match=field):
+        load_server_config(path)
+
+
+class FakeLogger:
+    def error(self, _message):
+        pass
+
+
+class FakeRequest:
+    def __init__(self, path: str = "", query: dict[str, str] | None = None):
+        self.match_info = {"path": path}
+        self.query = query or {}
+
+
+def _server(static_root: Path) -> WebControlServer:
+    config = WebServerConfig(
+        bind_host="127.0.0.1",
+        port=8765,
+        allowed_origins=("same-origin",),
+        max_clients=8,
+        max_message_bytes=65536,
+        discovery_period_sec=1.0,
+        web_override_timeout_sec=5.0,
+    )
+    return WebControlServer(
+        config=config,
+        manifest={"robots": []},
+        static_root=static_root,
+        description_root=static_root,
+        calibration_config_file=static_root / "calibration.yaml",
+        calibration_log_root=static_root / "logs",
+        on_command=lambda *_args: None,
+        on_client_connected=None,
+        logger=FakeLogger(),
+    )
+
+
+def test_static_root_serves_index_when_index_is_symlink(tmp_path):
+    static_root = tmp_path / "static"
+    static_root.mkdir()
+    target_dir = tmp_path / "built"
+    target_dir.mkdir()
+    (target_dir / "index.html").write_text("ok", encoding="utf-8")
+    (static_root / "index.html").symlink_to(target_dir / "index.html")
+
+    response = asyncio.run(_server(static_root)._static_asset(FakeRequest("")))
+
+    assert response.status == 200
+
+
+def test_web_control_is_open_without_browser_authentication(tmp_path):
+    static_root = tmp_path / "static"
+    static_root.mkdir()
+    (static_root / "index.html").write_text("ok", encoding="utf-8")
+
+    assert _server(static_root).read_only is False
+
+
+def test_static_root_rejects_parent_traversal(tmp_path):
+    static_root = tmp_path / "static"
+    static_root.mkdir()
+    (static_root / "index.html").write_text("ok", encoding="utf-8")
+
+    with pytest.raises(web.HTTPNotFound):
+        asyncio.run(_server(static_root)._static_asset(FakeRequest("../package.xml")))
+
+
+def test_calibration_preview_is_limited_to_log_root(tmp_path):
+    static_root = tmp_path / "static"
+    static_root.mkdir()
+    (static_root / "index.html").write_text("ok", encoding="utf-8")
+    logs = static_root / "logs" / "session-1"
+    logs.mkdir(parents=True)
+    preview = logs / "l-preview.png"
+    preview.write_bytes(b"png")
+    response = asyncio.run(
+        _server(static_root)._calibration_preview(FakeRequest("session-1/l-preview.png"))
+    )
+    assert response.status == 200
+
+    with pytest.raises(web.HTTPNotFound):
+        asyncio.run(_server(static_root)._calibration_preview(FakeRequest("../index.html")))
+
+
+def test_calibration_sessions_list_only_valid_sessions_and_sample_counts(tmp_path):
+    static_root = tmp_path / "static"
+    static_root.mkdir()
+    (static_root / "index.html").write_text("ok", encoding="utf-8")
+    session = static_root / "logs" / "camera_calibration" / "session-20260821T102303.053863Z"
+    batch = session / "batches" / "20260821T102303.053863Z"
+    batch.mkdir(parents=True)
+    for arm in ("l", "m", "r"):
+        (batch / f"{arm}-0000.json").write_text(
+            json.dumps({"sample_id": f"{arm}-0000-example", "base_to_tool": [[1.0]]}),
+            encoding="utf-8",
+        )
+    (session / "calibration_result.json").write_text("{}", encoding="utf-8")
+    ignored = static_root / "logs" / "camera_calibration" / "not-a-session"
+    ignored.mkdir()
+
+    response = asyncio.run(_server(static_root)._calibration_sessions(FakeRequest()))
+
+    payload = json.loads(response.body)
+    assert len(payload["sessions"]) == 1
+    listed = payload["sessions"][0]
+    assert listed["session_id"] == "session-20260821T102303.053863Z"
+    assert listed["sample_counts"] == {"l": 1, "m": 1, "r": 1}
+    assert listed["solved"] is True
+    assert listed["created_at"].endswith("+00:00")
+
+
+def test_calibration_session_cleanup_and_explicit_delete_are_scoped_to_sessions(tmp_path):
+    static_root = tmp_path / "static"
+    static_root.mkdir()
+    (static_root / "index.html").write_text("ok", encoding="utf-8")
+    sessions_root = static_root / "logs" / "camera_calibration"
+    empty = sessions_root / "session-20260821T100000.000000Z"
+    kept = sessions_root / "session-20260821T100001.000000Z"
+    (empty / "attempts").mkdir(parents=True)
+    batch = kept / "batches" / "batch-1"
+    batch.mkdir(parents=True)
+    (batch / "l-0000.json").write_text(
+        json.dumps({"sample_id": "l-0000-example", "base_to_tool": [[1.0]]}),
+        encoding="utf-8",
+    )
+    server = _server(static_root)
+
+    response = asyncio.run(server._calibration_sessions(FakeRequest(query={"delete_empty": "true"})))
+
+    payload = json.loads(response.body)
+    assert payload["deleted_session_ids"] == [empty.name]
+    assert [session["session_id"] for session in payload["sessions"]] == [kept.name]
+    assert not empty.exists()
+    deleted = asyncio.run(
+        server._delete_calibration_session(
+            type("Request", (), {"match_info": {"session_id": kept.name}})()
+        )
+    )
+    assert json.loads(deleted.body) == {"deleted_session_id": kept.name}
+    assert not kept.exists()
+
+    with pytest.raises(web.HTTPNotFound):
+        asyncio.run(
+            server._delete_calibration_session(
+                type("Request", (), {"match_info": {"session_id": "../outside"}})()
+            )
+        )
+
+
+def _write_config(tmp_path, extra):
+    document = {
+        "server": {"bind_host": "127.0.0.1", "port": 8765, "allowed_origins": ["same-origin"]},
+        "input_mode": {"discovery_period_sec": 1.0, "web_override_timeout_sec": 5.0},
+        **extra,
+    }
+    path = tmp_path / "web.yaml"
+    path.write_text(yaml.safe_dump(document), encoding="utf-8")
+    return path
+
+
+def test_pika_switch_is_hidden_without_a_block(tmp_path):
+    assert load_server_config(_write_config(tmp_path, {})).pika_helper_url == ""
+
+
+def test_pika_switch_block_is_loaded(tmp_path):
+    config = load_server_config(_write_config(tmp_path, {"pika_switch": {
+        "helper_url": "http://127.0.0.1:8783/", "helper_timeout_sec": 25.0, "input_fresh_ms": 400,
+        "input_wait_timeout_sec": 30.0, "status_poll_sec": 2.0, "mode_switch_timeout_sec": 150.0,
+        "mode": "pikavelocity", "off_mode": "none",
+    }}))
+    assert config.pika_helper_url == "http://127.0.0.1:8783"
+    assert config.pika_input_fresh_ms == 400.0
+    assert (config.pika_mode, config.pika_off_mode) == ("pikavelocity", "none")
+    assert config.pika_off_mode_timeout_sec == 10.0  # default
+
+
+def test_pika_off_mode_timeout_is_loaded(tmp_path):
+    config = load_server_config(_write_config(tmp_path, {"pika_switch": {
+        "helper_url": "http://127.0.0.1:8783", "off_mode_timeout_sec": 7,
+    }}))
+    assert config.pika_off_mode_timeout_sec == 7.0
+
+
+@pytest.mark.parametrize("bad", [
+    {"helper_url": "ftp://x"}, {"helper_url": "http://127.0.0.1:8783", "input_fresh_ms": 0},
+    {"helper_url": "http://127.0.0.1:8783", "mode": "Pika Velocity"},
+    {"helper_url": "http://127.0.0.1:8783", "off_mode_timeout_sec": 0},
+    {"helper_url": "http://127.0.0.1:8783", "off_mode_timeout_sec": True},
+])
+def test_pika_switch_block_is_validated(tmp_path, bad):
+    with pytest.raises(ValueError, match="pika_switch"):
+        load_server_config(_write_config(tmp_path, {"pika_switch": bad}))
+
+
+def test_repo_config_enables_the_pika_switch():
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[4]
+    config = load_server_config(root / "config/ros/realman_web_control.yaml")
+    assert config.pika_helper_url == "http://127.0.0.1:8783"
+    # Worst helper start: status_timeout_sec 5 + timeout_sec 20 + status 5 (config/docker/pika_helper.json).
+    assert config.pika_helper_timeout_sec > 30
+    assert config.pika_off_mode_timeout_sec == 10.0

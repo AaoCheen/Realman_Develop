@@ -1,0 +1,442 @@
+# Runtime services for the RM65 ROS 2 Humble system. The repository-root
+# docker-compose.yml includes this file so standard commands still work while
+# substantive configuration stays under config/.
+x-realman-common: &realman-common
+  image: rm65-humble-rviz:local
+  build:
+    context: .
+    dockerfile: config/docker/ros2-humble-rviz.Dockerfile
+    # Build-time network.  host is required: robot hosts use systemd-resolved
+    # (127.0.0.53), which a bridge-networked build container cannot reach, so
+    # pip DNS resolution would fail with "Temporary failure in name resolution".
+    network: host
+    args:
+      # Domestic defaults accelerate first-time builds. Every value can be
+      # replaced by an official upstream or an internal mirror at invocation.
+      ROS_BASE_IMAGE: ${ROS_BASE_IMAGE:-docker.m.daocloud.io/library/ros:humble-ros-base}
+      UBUNTU_APT_MIRROR: ${UBUNTU_APT_MIRROR:-https://mirrors.aliyun.com/ubuntu}
+      UBUNTU_PORTS_APT_MIRROR: ${UBUNTU_PORTS_APT_MIRROR:-https://mirrors.aliyun.com/ubuntu-ports}
+      ROS2_APT_MIRROR: ${ROS2_APT_MIRROR:-https://mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu}
+      # Only keeps the apt layer's cache key stable; pip reads PIP_INDEX_URL below.
+      PYPI_INDEX_URL: ${PYPI_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+      # Package sources of the pip layers. Pick mirrors that are fast over plain
+      # HTTP/1.1, not just reachable: see the measurements in the Dockerfile.
+      PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.mirrors.ustc.edu.cn/simple}
+      PYTORCH_INDEX_URL: ${PYTORCH_INDEX_URL:-https://mirrors.nju.edu.cn/pytorch/whl/cpu}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
+  network_mode: host
+  ipc: host
+  environment:
+    # Host networking plus ROS_LOCALHOST_ONLY=0 exposes DDS discovery to remote
+    # Humble hosts using the same domain. Firewalls must permit DDS UDP traffic.
+    ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+    ROS_LOCALHOST_ONLY: ${ROS_LOCALHOST_ONLY:-0}
+    # The host Orbbec overlay and the container can carry different Fast DDS
+    # patch versions. Force UDP so image data does not select an incompatible
+    # same-host shared-memory transport after discovery succeeds.
+    FASTDDS_BUILTIN_TRANSPORTS: ${FASTDDS_BUILTIN_TRANSPORTS:-UDPv4}
+    REALMAN_CONFIG_ROOT: /opt/rm65_ws/config
+    REALMAN_LOG_ROOT: /opt/rm65_ws/logs
+    # `./rm65 bt` opts in by exec'ing into an already-running bringup container.
+    # Keep normal production bringup free of behavior-tree processes and any
+    # real-motion side effect.
+    BT_AUTOSTART: ${BT_AUTOSTART:-false}
+    REALMAN_BT_ARM_ID: ${REALMAN_BT_ARM_ID:-r}
+    REALMAN_BT_DRY_RUN: ${REALMAN_BT_DRY_RUN:-true}
+    BT_SERVER_HOST: ${BT_SERVER_HOST:-0.0.0.0}
+    BT_SERVER_PORT: ${BT_SERVER_PORT:-8080}
+    # Production monitor endpoints are read-only; the executor owns all tree
+    # mutations and publishes this atomically replaced runtime snapshot.
+    BT_READ_ONLY: "true"
+    BT_RUNTIME_SNAPSHOT: ${BT_RUNTIME_SNAPSHOT:-/tmp/realman-bt-workspace/runtime.json}
+    # CLI runs are one-shot and mutually exclusive inside the shared driver
+    # container. Final snapshots are archived through the host logs mount.
+    # Empty means bt-start uses the behavior tree's XML metadata. The CLI
+    # can still pass BT_EXIT_ON_TERMINAL explicitly as an override.
+    BT_EXIT_ON_TERMINAL: ${BT_EXIT_ON_TERMINAL:-}
+    BT_RUNTIME_ARCHIVE_ROOT: ${BT_RUNTIME_ARCHIVE_ROOT:-/opt/rm65_ws/logs/behavior-trees}
+    BT_EDITOR_DIST: /opt/rm65_ws/behavior_tree/editor-dist
+    # The launch file scans this path/glob and waits when it is not present.
+    REALMAN_JOY_DEVICE: ${REALMAN_JOY_DEVICE:-auto}
+    # VLA policy service endpoint consumed by config/ros/policy_bridge.yaml
+    # (${POLICY_WS_HOST}). Host networking makes 127.0.0.1 the industrial host.
+    POLICY_WS_HOST: ${POLICY_WS_HOST:-127.0.0.1}
+  volumes:
+    # Runtime config edits take effect on the next launch without rebuilding.
+    - ./config:/opt/rm65_ws/config:ro
+    # Keep ROS 2's timestamped run directories and node log files on the host.
+    - ./logs:/opt/rm65_ws/logs
+    # Session data is runtime data, deliberately outside read-only config/.
+    # The collector owns only this mounted directory and never writes driver config.
+    - ./recordings:/data/realman-recordings
+  stdin_open: true
+  tty: true
+
+x-rm65-rviz-common: &rm65-rviz-common
+  <<: *realman-common
+  environment:
+    ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+    ROS_LOCALHOST_ONLY: ${ROS_LOCALHOST_ONLY:-0}
+    FASTDDS_BUILTIN_TRANSPORTS: ${FASTDDS_BUILTIN_TRANSPORTS:-UDPv4}
+    REALMAN_CONFIG_ROOT: /opt/rm65_ws/config
+    REALMAN_LOG_ROOT: /opt/rm65_ws/logs
+    REALMAN_JOY_DEVICE: ${REALMAN_JOY_DEVICE:-auto}
+    # Forward the active desktop display and force software rendering to avoid
+    # host/container OpenGL driver mismatches.
+    DISPLAY: ${DISPLAY:-}
+    LIBGL_ALWAYS_SOFTWARE: ${LIBGL_ALWAYS_SOFTWARE:-1}
+    QT_X11_NO_MITSHM: "1"
+    XAUTHORITY: /tmp/.Xauthority
+  volumes:
+    - ./config:/opt/rm65_ws/config:ro
+    - ./logs:/opt/rm65_ws/logs
+    - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    # /dev/null keeps headless service selection parseable without X11. Graphical
+    # services still require XAUTHORITY to point to the active session's file.
+    - ${XAUTHORITY:-/dev/null}:/tmp/.Xauthority:ro
+    # Mount the authoritative root configuration read-only so TF layout edits
+    # take effect on the next container start without rebuilding the image.
+    - ./config:/opt/rm65_ws/install/rm65_description/share/rm65_description/config:ro
+  stdin_open: true
+  tty: true
+
+services:
+  # Existing single-arm viewer, retained for model inspection.
+  rm65_rviz:
+    <<: *rm65-rviz-common
+    command:
+      - ros2
+      - launch
+      - rm65_description
+      - display.launch.py
+      - model:=${RM65_MODEL:-RM65-B}
+
+  # Three-arm environment using the l, m, and r namespaces and TF prefixes.
+  rm65_three_rviz:
+    <<: *rm65-rviz-common
+    command:
+      - ros2
+      - launch
+      - rm65_description
+      - three_robots.launch.py
+      - use_gui:=${RM65_USE_GUI:-false}
+
+  # Three-arm viewer driven by real controller joint states. This service does
+  # not start Xbox or joystick nodes, so the driver/RViz path can be tested alone.
+  realman_driver_rviz:
+    <<: *rm65-rviz-common
+    command:
+      - ros2
+      - launch
+      - realman_bringup
+      - system.launch.py
+      - start_driver:=true
+      - start_joy_driver:=false
+      - start_controller:=false
+      - use_gui:=false
+      - use_rviz:=true
+
+  # Full system bringup with three arms, RViz 2, and a physical Xbox controller.
+  realman_bringup:
+    <<: *rm65-rviz-common
+    volumes:
+      - ./config:/opt/rm65_ws/config:ro
+      - ./logs:/opt/rm65_ws/logs
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ${XAUTHORITY:-/dev/null}:/tmp/.Xauthority:ro
+      - ./config:/opt/rm65_ws/install/rm65_description/share/rm65_description/config:ro
+      # Keep the directory mounted so a controller can be plugged in after the
+      # container starts. The launch file waits for the selected device.
+      - /dev/input:/dev/input:ro
+    device_cgroup_rules:
+      # Linux input event devices use character-device major 13.
+      - "c 13:* r"
+    command:
+      - ros2
+      - launch
+      - realman_bringup
+      - system.launch.py
+      - wait_for_joy_device:=true
+      - use_gui:=${RM65_USE_GUI:-false}
+      - use_rviz:=${RM65_USE_RVIZ:-true}
+
+  # Parameterized bringup for development and diagnostics. The fixed services
+  # above remain the stable operator presets; this target exposes the launch
+  # package switches through .env without requiring a Compose-file edit.
+  realman_bringup_custom:
+    <<: *rm65-rviz-common
+    volumes:
+      - ./config:/opt/rm65_ws/config:ro
+      # Web control persists operator-created records here when enabled; keep
+      # all other launch/config YAML read-only inside the container.
+      - ./config/web-control/joint-records:/opt/rm65_ws/config/web-control/joint-records:rw
+      # Shared behavior-tree favorites written by the :8765 page.
+      - ./config/web-control/behavior-trees:/opt/rm65_ws/config/web-control/behavior-trees:rw
+      # The directory mount lets the calibration node atomically replace the
+      # layout and create its .bak file. Node code writes only three_robots.yaml.
+      - ./config/ros:/opt/rm65_ws/config/ros:rw
+      - ./logs:/opt/rm65_ws/logs
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ${XAUTHORITY:-/dev/null}:/tmp/.Xauthority:ro
+      - ./config:/opt/rm65_ws/install/rm65_description/share/rm65_description/config:ro
+      # The Joy node is optional, but mapping the input directory lets one
+      # .env profile switch it on without changing the service definition.
+      - /dev/input:/dev/input:ro
+    device_cgroup_rules:
+      - "c 13:* r"
+    command:
+      - ros2
+      - launch
+      - realman_bringup
+      - system.launch.py
+      - start_robots:=${REALMAN_START_ROBOTS:-true}
+      - start_driver:=${REALMAN_START_DRIVER:-true}
+      - start_joy_driver:=${REALMAN_START_JOY_DRIVER:-false}
+      - start_controller:=${REALMAN_START_CONTROLLER:-false}
+      - use_gui:=${REALMAN_USE_GUI:-false}
+      - use_rviz:=${REALMAN_USE_RVIZ:-false}
+      - start_web_control:=${REALMAN_START_WEB_CONTROL:-false}
+      - start_bt_launcher:=${REALMAN_START_BT_LAUNCHER:-false}
+      - start_camera_calibration:=${REALMAN_START_CAMERA_CALIBRATION:-false}
+      - update_layout_after_calibration:=${REALMAN_UPDATE_LAYOUT_AFTER_CALIBRATION:-true}
+      - wait_for_joy_device:=${REALMAN_WAIT_FOR_JOY_DEVICE:-false}
+      - joy_device_path:=${REALMAN_JOY_DEVICE:-auto}
+      - joy_poll_interval:=${REALMAN_JOY_POLL_INTERVAL:-1.0}
+      - driver_config_file:=${REALMAN_DRIVER_CONFIG_FILE:-/opt/rm65_ws/config/ros/realman_driver.yaml}
+      - coordinates_config_file:=${REALMAN_COORDINATES_CONFIG_FILE:-/opt/rm65_ws/config/ros/realman_coordinates.yaml}
+      - motion_config_file:=${REALMAN_MOTION_CONFIG_FILE:-/opt/rm65_ws/config/ros/realman_motion.yaml}
+      - web_control_config_file:=${REALMAN_WEB_CONTROL_CONFIG_FILE:-/opt/rm65_ws/config/ros/realman_web_control.yaml}
+      - camera_calibration_config_file:=${REALMAN_CAMERA_CALIBRATION_CONFIG_FILE:-/opt/rm65_ws/config/ros/camera_calibration.yaml}
+      - joint_record_dir:=${REALMAN_JOINT_RECORD_DIR:-/opt/rm65_ws/config/web-control/joint-records}
+
+  # Headless remote-debug target. Publish sensor_msgs/Joy from another Humble
+  # host on the same ROS_DOMAIN_ID to exercise the controller node without USB.
+  realman_bringup_remote:
+    <<: *realman-common
+    devices:
+      # Stable udev aliases prevent ttyUSB numbering changes after reconnect/reboot.
+      # Environment overrides are useful on development hosts without these aliases.
+      - ${REALMAN_GRIPPER_RIGHT_DEVICE:-/dev/realman/gripper_right}:/dev/realman/gripper_right
+      - ${REALMAN_GRIPPER_LEFT_DEVICE:-/dev/realman/gripper_left}:/dev/realman/gripper_left
+      - ${REALMAN_GRIPPER_MID_DEVICE:-/dev/realman/gripper_mid}:/dev/realman/gripper_mid
+    volumes:
+      # REALMAN_START_WEB_CONTROL=true runs the browser bridge in this service;
+      # it needs write access only to confirmed joint record files.
+      - ./config:/opt/rm65_ws/config:ro
+      - ./config/web-control/joint-records:/opt/rm65_ws/config/web-control/joint-records:rw
+      # Shared behavior-tree favorites written by the :8765 page.
+      - ./config/web-control/behavior-trees:/opt/rm65_ws/config/web-control/behavior-trees:rw
+      - ./config/ros:/opt/rm65_ws/config/ros:rw
+      - ./logs:/opt/rm65_ws/logs
+    # Keep the production ROS graph available after host reboot, Docker daemon
+    # restart, or an unexpected launch/container exit. Operators can still stop
+    # it intentionally with `docker compose stop realman_bringup_remote`.
+    restart: unless-stopped
+    command:
+      - ros2
+      - launch
+      - realman_bringup
+      - system.launch.py
+      - start_joy_driver:=false
+      # Keep the production driver YAML as the default while allowing an
+      # explicit mock config for safe end-to-end launch validation. `./rm65`
+      # forces grippers off for that mock; direct Compose callers must pass
+      # REALMAN_START_GRIPPER=false as shown in the verification workflow.
+      - driver_config_file:=${REALMAN_DRIVER_CONFIG_FILE:-/opt/rm65_ws/config/ros/realman_driver.yaml}
+      - start_gripper:=${REALMAN_START_GRIPPER:-true}
+      - gripper_config_file:=${REALMAN_GRIPPER_CONFIG_FILE:-/opt/rm65_ws/config/ros/gripper.yaml}
+      - use_gui:=false
+      - use_rviz:=false
+      - start_web_control:=${REALMAN_START_WEB_CONTROL:-false}
+      # Localhost-only helper that lets the :8765 page start behavior trees.
+      - start_bt_launcher:=${REALMAN_START_BT_LAUNCHER:-true}
+      # Keep the camera-health publisher present so the Web calibration page
+      # can show all three ROS 2 image inputs during normal production bringup.
+      - start_camera_calibration:=true
+      - update_layout_after_calibration:=${REALMAN_UPDATE_LAYOUT_AFTER_CALIBRATION:-true}
+      - joint_record_dir:=${REALMAN_JOINT_RECORD_DIR:-/opt/rm65_ws/config/web-control/joint-records}
+
+  # Browser action console. It joins an existing ROS graph and serves the
+  # packaged URDF/static UI on http://<industrial-host>:8765/.
+  realman_web_control:
+    <<: *realman-common
+    volumes:
+      # Joint records are operator-created config/web-control YAML files and the
+      # parameter page writes config/ros; the rest of the root config tree
+      # remains read-only.
+      - ./config:/opt/rm65_ws/config:ro
+      - ./config/web-control/joint-records:/opt/rm65_ws/config/web-control/joint-records:rw
+      # Shared behavior-tree favorites written by the :8765 page.
+      - ./config/web-control/behavior-trees:/opt/rm65_ws/config/web-control/behavior-trees:rw
+      # The /params.html page writes catalog values back into config/ros/*.yaml
+      # (same mount as the bringup container).
+      - ./config/ros:/opt/rm65_ws/config/ros:rw
+      - ./logs:/opt/rm65_ws/logs
+    # Production :8765 console: recover after host reboot or Docker restart like
+    # realman_bringup_remote; `docker compose stop` still keeps it down.
+    restart: unless-stopped
+    command:
+      - ros2
+      - launch
+      - realman_web_control
+      - web_control.launch.py
+      - joint_record_dir:=${REALMAN_JOINT_RECORD_DIR:-/opt/rm65_ws/config/web-control/joint-records}
+
+  # Independent data collector: it joins an existing ROS graph, subscribes to
+  # driver outputs, and exposes only recording controls on loopback port 8770.
+  # It intentionally does not start drivers, motion control, or camera streaming.
+  realman_recording:
+    <<: *realman-common
+    # Production :8770 recorder: same reboot/Docker-restart recovery as bringup.
+    restart: unless-stopped
+    command:
+      - ros2
+      - launch
+      - realman_recording
+      - recording.launch.py
+      - recording_root:=${REALMAN_RECORDING_ROOT:-/data/realman-recordings}
+      - start_web_bridge:=${REALMAN_START_RECORDING_WEB:-true}
+
+  # RViz-only viewer for a remote realman_bringup_remote ROS graph. It does not
+  # start a local driver, robot_state_publisher, or fake joint-state publisher.
+  realman_remote_rviz:
+    <<: *rm65-rviz-common
+    command:
+      - ros2
+      - launch
+      - realman_bringup
+      - remote_rviz.launch.py
+
+  # RViz-only camera viewer. It subscribes to the production Orbbec image
+  # topics and never starts a RealMan driver or local camera device.
+  realman_camera_rviz:
+    <<: *rm65-rviz-common
+    command:
+      - rviz2
+      - -d
+      - /opt/rm65_ws/config/rviz/cameras.rviz
+
+  # Standalone Xbox validation. This starts only the SDL Joy publisher and the
+  # C++ button logger, so a controller can be tested without RViz or robot TF.
+  xbox_controller_test:
+    <<: *realman-common
+    volumes:
+      - ./config:/opt/rm65_ws/config:ro
+      - ./logs:/opt/rm65_ws/logs
+      # Keep the directory mounted so the controller can be connected later.
+      - /dev/input:/dev/input:ro
+    device_cgroup_rules:
+      - "c 13:* r"
+    command:
+      - ros2
+      - launch
+      - realman_bringup
+      - system.launch.py
+      - start_robots:=false
+      - start_driver:=false
+      - start_joy_driver:=true
+      - start_controller:=true
+      - wait_for_joy_device:=true
+      - use_gui:=false
+      - use_rviz:=false
+
+  # Standalone RealMan joint-state driver test. All l/m/r instances use the annotated
+  # mock configuration, so this service never contacts physical controllers.
+  realman_driver_test:
+    <<: *realman-common
+    command:
+      - ros2
+      - launch
+      - realman_robot_driver
+      - three_realman_drivers.launch.py
+      - config_file:=/opt/rm65_ws/config/ros/realman_driver_mock.yaml
+
+  # Isolated behavior-tree debug service; it never starts real drivers.
+  realman_bt_web:
+    <<: *realman-common
+    command:
+      - ros2
+      - launch
+      - realman_bt_mock
+      - behavior_tree_mock.launch.py
+
+  # VLA policy bridge: joins an existing ROS graph and converts between the
+  # policy WebSocket service and ROS 2 topics (pure publish layer). Started
+  # explicitly via `./rm65 up policy`; not part of default production bringup.
+  policy_bridge:
+    <<: *realman-common
+    command:
+      - ros2
+      - launch
+      - policy_bridge
+      - policy_bridge.launch.py
+      - config_file:=${POLICY_BRIDGE_CONFIG_FILE:-/opt/rm65_ws/config/ros/policy_bridge.yaml}
+      - active_side:=${POLICY_BRIDGE_ACTIVE_SIDE:-left}
+
+  # Training console (server5090 only, never on the robot): web UI + realman-train jobs on :8780,
+  # see website/docs/development/training-console-web.md. Opt-in profile, so no robot command builds or
+  # starts it: `docker compose --profile training up -d realman_training`. The console hands host paths to
+  # the host's docker daemon (openpi containers) and to ssh (realman_local), so they are mounted at the same
+  # absolute path and the container runs as the host user with the host's HOME. Values come from an untracked env
+  # file outside the repo (the repo-root .env is a tracked template), passed with --env-file.
+  realman_training:
+    profiles: [training]
+    build:
+      context: .  # the root docker-compose.yml include sets project_directory to the repo root
+      dockerfile: config/docker/training-console.Dockerfile
+      network: host  # same as the robot images: a bridge build container may not reach the host resolver
+      args:
+        PIP_INDEX_URL: ${TRAINING_PIP_INDEX_URL:-https://pypi.org/simple}
+        APT_MIRROR: ${TRAINING_APT_MIRROR:-}
+    image: realman-training-console:local
+    # nvidia for the GPU panel on a GPU host; runc where docker has no nvidia runtime and the panel reads a compute host.
+    runtime: ${TRAINING_RUNTIME:-nvidia}
+    pid: host
+    restart: unless-stopped
+    user: "${TRAINING_UID:-1000}:${TRAINING_GID:-1000}"
+    group_add: ["${TRAINING_DOCKER_GID:-984}"]
+    environment:
+      HOME: ${TRAINING_HOME:-/home/server5090}
+      DOCKER_CONFIG: /tmp/.docker
+      REALMAN_TRAINING_TOKEN: ${REALMAN_TRAINING_TOKEN:-}
+      REALMAN_TRAINING_CONFIG: ${TRAINING_REPO:-/home/server5090/organization/realman_pi}/config/training/training_console.yaml
+      # The console runs on its own bridge network: its 127.0.0.1 is not the host, where openpi-serve publishes its port.
+      REALMAN_TRAINING_PROBE_HOST: host.docker.internal
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: utility
+      # Compute host (EI) and the console's own layout on SJDrealman; unset = the server5090 layout.
+      REALMAN_COMPUTE_SSH_HOST: ${REALMAN_COMPUTE_SSH_HOST-}
+      REALMAN_COMPUTE_SSH_CONFIG: ${REALMAN_COMPUTE_SSH_CONFIG-}
+      REALMAN_COMPUTE_WORKDIR: ${REALMAN_COMPUTE_WORKDIR-}
+      REALMAN_RECORDING_SSH_HOST: ${REALMAN_RECORDING_SSH_HOST-realman_local}
+      REALMAN_TRAINING_DATA_ROOT: ${REALMAN_TRAINING_DATA_ROOT-}
+      REALMAN_TRAINING_ARM: ${REALMAN_TRAINING_ARM:-}
+      # The inference chain on this host (training_console.yaml serving; unset = the server5090 layout). On a host
+      # whose docker has no nvidia runtime: SERVE_RUNTIME=runc, the devices overlay and the driver version.
+      REALMAN_SERVE_OPENPI_REPO: ${REALMAN_SERVE_OPENPI_REPO:-}
+      REALMAN_SERVE_COMPOSE_OVERLAY: ${REALMAN_SERVE_COMPOSE_OVERLAY:-}
+      REALMAN_SERVE_MODEL: ${REALMAN_SERVE_MODEL:-}
+      REALMAN_SERVE_GPU: ${REALMAN_SERVE_GPU:-}
+      REALMAN_ROBOT_REPO: ${REALMAN_ROBOT_REPO:-}
+      SERVE_RUNTIME: ${SERVE_RUNTIME:-}
+      SERVE_DRIVER_VERSION: ${SERVE_DRIVER_VERSION:-}
+      SERVE_DRIVER_LIB_DIR: ${SERVE_DRIVER_LIB_DIR:-}
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    ports:
+      - "${TRAINING_BIND:-0.0.0.0}:8780:8780"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /usr/bin/docker:/usr/bin/docker:ro
+      - /usr/libexec/docker/cli-plugins:/usr/libexec/docker/cli-plugins:ro
+      - /etc/passwd:/etc/passwd:ro
+      - /etc/group:/etc/group:ro
+      - /etc/localtime:/etc/localtime:ro  # job and history times in the host's time zone
+      - ${TRAINING_HOME:-/home/server5090}/.ssh:${TRAINING_HOME:-/home/server5090}/.ssh:ro
+      - ${TRAINING_HOME:-/home/server5090}/data/realman:${TRAINING_HOME:-/home/server5090}/data/realman
+      # ro on server5090 (the real openpi checkout); rw on a console with a compute host, where it is the mirror the
+      # console writes (training configs). TRAINING_OPENPI_MOUNT=rw in that env file.
+      - ${TRAINING_HOME:-/home/server5090}/organization/openpi:${TRAINING_HOME:-/home/server5090}/organization/openpi:${TRAINING_OPENPI_MOUNT:-ro}
+      - ${TRAINING_HOME:-/home/server5090}/organization/openpi-docker-data:${TRAINING_HOME:-/home/server5090}/organization/openpi-docker-data
+      - ${TRAINING_REPO:-/home/server5090/organization/realman_pi}:${TRAINING_REPO:-/home/server5090/organization/realman_pi}:ro

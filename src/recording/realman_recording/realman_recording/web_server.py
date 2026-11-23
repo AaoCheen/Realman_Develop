@@ -1,0 +1,981 @@
+"""Dedicated aiohttp/WebSocket shell for the read-only recording dashboard.
+
+This server has a private event loop/thread.  It receives only coalesced state snapshots
+from the bridge and must never call archive/session/camera worker code.  Slow clients
+are dropped rather than allowed to accumulate a durable-data backlog.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import threading
+import time
+from pathlib import Path
+from typing import Any, Callable
+
+from .lerobot_web_replay import LeRobotReplayCatalog, queue_from_manifests
+from .lerobot_reindex import reindex_dataset
+from .episode_tags import EpisodeTagStore, TagConflict, tag_types
+from .session_store import SessionStore
+from .quality_events import QualityConflict, QualityReason, build_sidecar, session_document
+
+
+def _parse_range(header: str | None, size: int) -> tuple[int, int] | None:
+    """Parse a single-range ``Range`` header into an inclusive ``(start, end)`` pair.
+
+    Returns ``None`` when the header is absent, is not a ``bytes=`` range, or is
+    unsatisfiable for the given size.  Only the first range of a multi-range
+    header is honored; the video endpoint serves a single media file.
+    """
+    if not header or not header.startswith("bytes="):
+        return None
+    spec = header[len("bytes="):].split(",", 1)[0]
+    start_s, _, end_s = spec.partition("-")
+    try:
+        if start_s == "":
+            if not end_s:
+                return None
+            suffix = int(end_s)
+            start = max(0, size - suffix)
+            end = size - 1
+        else:
+            start = int(start_s)
+            end = int(end_s) if end_s else size - 1
+    except ValueError:
+        return None
+    if start < 0 or start >= size or start > end:
+        return None
+    return start, min(end, size - 1)
+
+
+def _frame_order_key(name: str) -> int:
+    """Order raw camera frames by their nanosecond-timestamp filename stem."""
+    stem = name.rsplit(".", 1)[0]
+    try:
+        return int(stem)
+    except ValueError:
+        return 0
+
+
+def _parse_thumbnail_width(value: str | None) -> int | None:
+    """Parse an optional ``?w=`` preview width, rejecting absurd values."""
+    if not value:
+        return None
+    try:
+        width = int(value)
+    except ValueError:
+        return None
+    return width if 0 < width <= 1280 else None
+
+
+def _thumbnail_jpeg(path: Path, width: int) -> bytes:
+    """Decode and downscale one raw camera JPEG for a fast low-bandwidth preview."""
+    import io
+
+    from PIL import Image
+
+    with Image.open(path) as image:
+        image = image.convert("RGB")
+        if image.width > width:
+            height = max(1, round(image.height * width / image.width))
+            image = image.resize((width, height), Image.LANCZOS)
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=70)
+        return buffer.getvalue()
+
+
+class RecordingWebServer:
+    def __init__(
+        self,
+        *,
+        bind_host: str,
+        port: int,
+        static_root: str | Path,
+        manifest: dict[str, Any],
+        description_root: str | Path,
+        recording_root: str | Path,
+        lerobot_export_dir: str | Path,
+        logger: Any,
+        export_all: Callable[[], dict[str, Any]] | None = None,
+        quality_reasons: tuple[QualityReason, ...] = (),
+        pika_recalibrate: Callable[[], tuple[int, dict[str, Any]]] | None = None,
+        pika_helper_status: Callable[[], tuple[int, dict[str, Any]]] | None = None,
+    ) -> None:
+        self._bind_host = bind_host
+        self._port = port
+        self._static_root = Path(static_root).resolve()
+        self._manifest = manifest
+        self._description_root = Path(description_root).resolve()
+        self._recording_root = Path(recording_root).resolve()
+        self._lerobot_export_dir = Path(lerobot_export_dir).resolve()
+        self._replay = LeRobotReplayCatalog(recording_root, lerobot_export_dir)
+        self._tags = EpisodeTagStore(recording_root)
+        self._export_all = export_all
+        self._quality_reasons = tuple(quality_reasons)
+        self._pika_recalibrate = pika_recalibrate
+        self._pika_helper_status = pika_helper_status
+        self._logger = logger
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self._ready = threading.Event()
+        self._startup_error: BaseException | None = None
+        self._clients: set[Any] = set()
+        self._runner: Any = None
+        self._preview_lock = threading.Lock()
+        self._previews: dict[str, bytes] = {}
+        self._snapshot_lock = threading.Lock()
+        self._pending_snapshot: dict[str, Any] | None = None
+        self._snapshot_flush_scheduled = False
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._thread_main, name="recording-web", daemon=True)
+        self._thread.start()
+        if not self._ready.wait(timeout=5.0):
+            raise RuntimeError("recording web server startup timed out")
+        if self._startup_error is not None:
+            raise RuntimeError(f"recording web server startup failed: {self._startup_error}")
+
+    def stop(self) -> None:
+        loop, thread = self._loop, self._thread
+        if loop is None or thread is None:
+            return
+        future = asyncio.run_coroutine_threadsafe(self._shutdown(), loop)
+        future.result(timeout=5.0)
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5.0)
+        self._thread = None
+
+    def send_snapshot(self, payload: dict[str, Any]) -> None:
+        """Coalesce snapshots so slow clients cannot create an asyncio backlog."""
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return
+        with self._snapshot_lock:
+            self._pending_snapshot = payload
+            if self._snapshot_flush_scheduled:
+                return
+            self._snapshot_flush_scheduled = True
+        asyncio.run_coroutine_threadsafe(self._flush_snapshot(), loop)
+
+    def send_event(self, payload: dict[str, Any]) -> None:
+        """Schedule a small lifecycle event without waiting for any WebSocket client."""
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._broadcast(payload), loop)
+
+    async def _flush_snapshot(self) -> None:
+        """Send newest state and discard intermediate snapshots by design."""
+        while True:
+            with self._snapshot_lock:
+                payload = self._pending_snapshot
+                self._pending_snapshot = None
+            if payload is None:
+                with self._snapshot_lock:
+                    if self._pending_snapshot is None:
+                        self._snapshot_flush_scheduled = False
+                        return
+                    payload = self._pending_snapshot
+                    self._pending_snapshot = None
+                if payload is None:
+                    return
+            await self._broadcast(payload)
+
+    def set_preview(self, camera_id: str, jpeg: bytes) -> None:
+        """Replace one preview frame; producer threads never wait for Web clients."""
+        if not camera_id or not jpeg:
+            return
+        with self._preview_lock:
+            self._previews[camera_id] = jpeg
+
+    def _thread_main(self) -> None:
+        loop = asyncio.new_event_loop()
+        self._loop = loop
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._start_async())
+        except BaseException as error:
+            self._startup_error = error
+            self._ready.set()
+            return
+        self._ready.set()
+        loop.run_forever()
+        loop.close()
+
+    async def _start_async(self) -> None:
+        try:
+            from aiohttp import web
+        except ImportError as error:
+            raise RuntimeError("python3-aiohttp is required for recording Web display") from error
+
+        @web.middleware
+        async def _no_cache(request, handler):
+            response = await handler(request)
+            if request.path.startswith("/api/"):
+                response.headers["Cache-Control"] = "no-store"
+            return response
+
+        app = web.Application(client_max_size=16_384, middlewares=[_no_cache])
+        app.router.add_get("/healthz", self._health)
+        app.router.add_get("/api/layout", self._layout)
+        app.router.add_get("/ws", self._websocket)
+        app.router.add_get("/preview/{camera_id}.jpg", self._preview)
+        app.router.add_get("/api/lerobot", self._lerobot_list)
+        app.router.add_get("/api/lerobot/queue", self._lerobot_queue)
+        app.router.add_get("/api/lerobot/pending", self._lerobot_pending)
+        app.router.add_get("/api/lerobot/quality_events", self._quality_sidecar)
+        app.router.add_get("/api/recording/tag-defaults", self._tag_defaults_get)
+        app.router.add_put("/api/recording/tag-defaults", self._tag_defaults_put)
+        app.router.add_post("/api/recording/tags/backfill", self._tags_backfill)
+        app.router.add_get("/api/recording/episode-meta", self._episode_meta_get)
+        app.router.add_post("/api/recording/episode-meta/rebuild", self._episode_meta_rebuild)
+        app.router.add_get("/api/recording/{session_id}/tags", self._tags_get)
+        app.router.add_put("/api/recording/{session_id}/tags", self._tags_put)
+        app.router.add_get("/api/recording/{session_id}/quality_events", self._quality_get)
+        app.router.add_put("/api/recording/{session_id}/quality_events", self._quality_put)
+        app.router.add_post("/api/lerobot/export-all", self._lerobot_export_all)
+        app.router.add_post("/api/lerobot/reindex", self._lerobot_reindex)
+        app.router.add_get("/api/lerobot/{session_id}/summary", self._lerobot_summary)
+        app.router.add_get("/api/lerobot/{session_id}/frames", self._lerobot_frames)
+        app.router.add_get(
+            "/api/lerobot/{session_id}/frames/{frame_index}/cameras/{camera_id}",
+            self._lerobot_image,
+        )
+        app.router.add_get(
+            "/api/lerobot/{session_id}/video/{camera_id}", self._lerobot_video
+        )
+        app.router.add_get("/api/lerobot/{session_id}/raw", self._lerobot_raw)
+        app.router.add_get("/api/lerobot/{session_id}/raw/replay", self._lerobot_raw_replay)
+        app.router.add_get(
+            "/api/lerobot/{session_id}/raw/image/{camera_id}/{filename}",
+            self._lerobot_raw_image,
+        )
+        app.router.add_post("/api/lerobot/{session_id}/delete", self._lerobot_delete)
+        app.router.add_post("/api/lerobot/{session_id}/restore", self._lerobot_restore)
+        app.router.add_post("/api/lerobot/{session_id}/remove", self._lerobot_remove)
+        app.router.add_post("/api/lerobot/{session_id}/discard", self._lerobot_discard)
+        app.router.add_get("/api/lerobot/trash", self._lerobot_trash)
+        app.router.add_post("/api/lerobot/trash/remove-all", self._lerobot_remove_all_hidden)
+        app.router.add_post("/api/lerobot/{session_id}/task", self._lerobot_task)
+        app.router.add_get("/api/lerobot/{session_id}/subtasks", self._lerobot_subtasks)
+        app.router.add_post("/api/lerobot/{session_id}/subtasks", self._lerobot_subtasks_update)
+        app.router.add_post("/api/pika/recalibrate", self._pika_recalibrate_route)
+        app.router.add_get("/api/pika/helper", self._pika_helper_route)
+        app.router.add_get("/models/{path:.*}", self._model_asset)
+        app.router.add_get("/{path:.*}", self._static_asset)
+        self._runner = web.AppRunner(app, access_log=None)
+        await self._runner.setup()
+        await web.TCPSite(self._runner, self._bind_host, self._port).start()
+        # Build the unified index in the background on startup.  Legacy
+        # manifests remain untouched until the explicit migration endpoint.
+        async def initial_index() -> None:
+            try:
+                await asyncio.to_thread(self._tags.rebuild)
+            except Exception as error:
+                self._logger.warning(f"Episode meta startup rebuild failed: {error}")
+        asyncio.create_task(initial_index())
+
+    async def _shutdown(self) -> None:
+        for client in list(self._clients):
+            await client.close(code=1001, message=b"recording server shutdown")
+        if self._runner is not None:
+            await self._runner.cleanup()
+            self._runner = None
+
+    async def _health(self, _request: Any) -> Any:
+        from aiohttp import web
+        return web.json_response({"status": "ok", "read_only_robot": True})
+
+    async def _layout(self, _request: Any) -> Any:
+        from aiohttp import web
+        return web.json_response(self._manifest)
+
+    async def _model_asset(self, request: Any) -> Any:
+        from aiohttp import web
+        relative = Path(request.match_info["path"])
+        if relative.is_absolute() or ".." in relative.parts:
+            raise web.HTTPNotFound(text="model asset does not exist")
+        candidate = self._description_root / relative
+        if self._description_root not in candidate.parents or not candidate.is_file():
+            raise web.HTTPNotFound(text="model asset does not exist")
+        return web.FileResponse(candidate)
+
+    async def _static_asset(self, request: Any) -> Any:
+        from aiohttp import web
+        relative = Path(request.match_info["path"] or "index.html")
+        if relative.is_absolute() or ".." in relative.parts:
+            raise web.HTTPNotFound(text="static asset does not exist")
+        candidate = self._static_root / relative
+        if self._static_root in candidate.parents and candidate.is_file():
+            return web.FileResponse(candidate)
+        index_file = self._static_root / "index.html"
+        if index_file.is_file():
+            return web.FileResponse(index_file)
+        raise web.HTTPNotFound(text="static asset does not exist")
+
+    async def _preview(self, request: Any) -> Any:
+        from aiohttp import web
+        camera_id = request.match_info["camera_id"]
+        with self._preview_lock:
+            jpeg = self._previews.get(camera_id)
+        if jpeg is None:
+            raise web.HTTPNotFound(text="preview is not available")
+        return web.Response(body=jpeg, content_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+    async def _lerobot_list(self, _request: Any) -> Any:
+        """List completed LeRobot episodes without exposing filesystem paths."""
+        from aiohttp import web
+        try:
+            # Dataset discovery may open metadata/video indexes. Keep that
+            # synchronous SDK work off the aiohttp event loop so live snapshot
+            # WebSockets remain responsive while the replay tab is opened.
+            sessions = await asyncio.to_thread(self._replay.list_datasets)
+            for session in sessions:
+                try:
+                    session.update(await asyncio.to_thread(self._tags.get, session["session_id"]))
+                except (OSError, ValueError):
+                    pass
+            return web.json_response({"sessions": sessions})
+        except Exception as error:  # noqa: BLE001 - read-only endpoint must stay available
+            self._logger.warning(f"LeRobot replay listing failed: {error}")
+            # An empty list means "there are no completed episodes".  A missing
+            # SDK or a decoder failure is a distinct operational state and must
+            # be visible to the UI as 503 without taking down live WebSocket data.
+            raise web.HTTPServiceUnavailable(text="LeRobot replay is unavailable") from error
+
+    async def _lerobot_pending(self, _request: Any) -> Any:
+        """List finalized sessions still awaiting adopt/export (decision=PENDING)."""
+        from aiohttp import web
+        try:
+            sessions = await asyncio.to_thread(self._replay.list_pending)
+            for session in sessions:
+                try:
+                    session.update(await asyncio.to_thread(self._tags.get, session["session_id"]))
+                except (OSError, ValueError):
+                    pass
+            return web.json_response({"sessions": sessions})
+
+        except Exception as error:  # noqa: BLE001 - read-only endpoint must stay available
+            self._logger.warning(f"LeRobot pending listing failed: {error}")
+            raise web.HTTPServiceUnavailable(text="LeRobot pending is unavailable") from error
+
+    @staticmethod
+    async def _tag_body(request: Any) -> dict[str, Any]:
+        from aiohttp import web
+        try:
+            def no_duplicates(pairs):
+                result = {}
+                for key, value in pairs:
+                    if key in result:
+                        raise ValueError(f"duplicate JSON key: {key}")
+                    result[key] = value
+                return result
+            body = json.loads(await request.text(), object_pairs_hook=no_duplicates)
+        except Exception as error:
+            raise web.HTTPBadRequest(text="request body must be JSON") from error
+        if not isinstance(body, dict):
+            raise web.HTTPBadRequest(text="request body must be an object")
+        return body
+
+    async def _tag_defaults_get(self, _request: Any) -> Any:
+        from aiohttp import web
+        try:
+            values = await asyncio.to_thread(self._tags.defaults)
+            return web.json_response({"tags": values, "tag_types": tag_types(values),
+                                      "arms": ["left", "right", "both"], "lighting_levels": [1, 2, 3]})
+        except (OSError, ValueError) as error:
+            raise web.HTTPServiceUnavailable(text=str(error)) from error
+
+    async def _tag_defaults_put(self, request: Any) -> Any:
+        from aiohttp import web
+        body = await self._tag_body(request)
+        try:
+            result = await asyncio.to_thread(self._tags.save_defaults, body.get("tags"), body.get("set_types", {}))
+            return web.json_response(result, status=200 if result["meta_synced"] else 207)
+        except ValueError as error:
+            raise web.HTTPBadRequest(text=str(error)) from error
+
+    async def _tags_get(self, request: Any) -> Any:
+        from aiohttp import web
+        try:
+            return web.json_response(await asyncio.to_thread(self._tags.get, request.match_info["session_id"]))
+        except (OSError, ValueError) as error:
+            raise web.HTTPNotFound(text=str(error)) from error
+
+    async def _tags_put(self, request: Any) -> Any:
+        from aiohttp import web
+        body = await self._tag_body(request)
+        try:
+            result = await asyncio.to_thread(self._tags.update, request.match_info["session_id"],
+                                             body.get("revision"), body.get("set", {}), body.get("reset", []),
+                                             body.get("delete", []), body.get("set_types", {}))
+            return web.json_response(result, status=200 if result["meta_synced"] else 207)
+        except TagConflict as error:
+            raise web.HTTPConflict(text=str(error)) from error
+        except ValueError as error:
+            raise web.HTTPBadRequest(text=str(error)) from error
+        except OSError as error:
+            raise web.HTTPNotFound(text=str(error)) from error
+
+    async def _tags_backfill(self, request: Any) -> Any:
+        from aiohttp import web
+        body = await self._tag_body(request)
+        if type(body.get("dry_run")) is not bool:
+            raise web.HTTPBadRequest(text="dry_run must be a boolean")
+        if body["dry_run"] is False and body.get("confirm") is not True:
+            raise web.HTTPBadRequest(text="confirm=true is required")
+        result = await asyncio.to_thread(self._tags.backfill, dry_run=body["dry_run"])
+        return web.json_response(result, status=200 if result.get("meta_synced", True) and not result["errors"] else 207)
+
+    async def _episode_meta_get(self, _request: Any) -> Any:
+        from aiohttp import web
+        try:
+            result = await asyncio.to_thread(self._tags.rebuild)
+            return web.json_response(result)
+        except (OSError, ValueError) as error:
+            raise web.HTTPServiceUnavailable(text=str(error)) from error
+
+    async def _episode_meta_rebuild(self, _request: Any) -> Any:
+        from aiohttp import web
+        body = await self._tag_body(_request) if _request.can_read_body else {}
+        if body.get("initialize_missing"):
+            if body.get("confirm") is not True:
+                raise web.HTTPBadRequest(text="confirm=true is required for history migration")
+            result = await asyncio.to_thread(self._tags.migrate_missing)
+            return web.json_response(result, status=200 if result["meta_synced"] else 207)
+        return await self._episode_meta_get(_request)
+
+    @staticmethod
+    def _read_raw_session(directory: Path) -> dict[str, Any]:
+        """Summarize an un-exported session for the raw-preview viewer."""
+        manifest_path = directory / "manifest.json"
+        if not manifest_path.is_file():
+            raise ValueError("recording session has no finalized manifest.json")
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("recording manifest must be a JSON object")
+        metadata = payload.get("metadata") or {}
+        summary = payload.get("summary") or {}
+        cameras: dict[str, list[str]] = {}
+        videos_dir = directory / "videos"
+        if videos_dir.is_dir():
+            for camera_dir in sorted(videos_dir.iterdir()):
+                if not camera_dir.is_dir() or camera_dir.name.startswith("."):
+                    continue
+                frames = sorted(
+                    (path.name for path in camera_dir.glob("*.jpg")),
+                    key=_frame_order_key,
+                )
+                if frames:
+                    cameras[camera_dir.name] = frames
+        started = payload.get("started_realtime_ns")
+        ended = payload.get("ended_realtime_ns")
+        duration_s: float | None = None
+        if isinstance(started, int) and isinstance(ended, int) and ended >= started:
+            duration_s = (ended - started) / 1e9
+        number = metadata.get("session_number")
+        return {
+            "session_id": directory.name,
+            "session_number": number if isinstance(number, int) else 0,
+            "task": metadata.get("task", ""),
+            "state": payload.get("state", ""),
+            "duration_s": duration_s,
+            "summary": summary,
+            "cameras": cameras,
+        }
+
+    async def _lerobot_raw(self, request: Any) -> Any:
+        """Return raw-preview metadata (cameras + sorted frame names) for one session."""
+        from aiohttp import web
+        session_id = request.match_info["session_id"]
+        try:
+            directory = self._session_directory(session_id)
+            payload = await asyncio.to_thread(self._read_raw_session, directory)
+        except ValueError as error:
+            raise web.HTTPNotFound(text=str(error)) from error
+        return web.json_response(payload)
+
+    def _build_raw_replay(self, directory: Path, fps: float) -> dict[str, Any]:
+        """Read one pending session into the inline replay payload (cached per manifest mtime)."""
+        from .raw_replay import build_raw_replay, camera_frames, read_state_streams
+
+        manifest_path = directory / "manifest.json"
+        if not manifest_path.is_file():
+            raise ValueError("recording session has no finalized manifest.json")
+        mcap = directory / "state.mcap"
+        key = (
+            str(directory), fps, manifest_path.stat().st_mtime_ns,
+            # state.mcap is a rosbag2 directory; its mtime moves when the bag is written.
+            mcap.stat().st_mtime_ns if mcap.exists() else 0,
+        )
+        cache: dict[Any, dict[str, Any]] = self.__dict__.setdefault("_raw_replay_cache", {})
+        if key in cache:
+            return cache[key]
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict):
+            raise ValueError("recording manifest must be a JSON object")
+        reader = getattr(self, "_raw_stream_reader", None) or read_state_streams
+        try:
+            streams = reader(directory, manifest)
+            stream_error = ""
+        except Exception as error:  # noqa: BLE001 - cameras still replay without state
+            self._logger.warning(f"raw replay could not read state.mcap for {directory.name}: {error}")
+            streams, stream_error = {}, str(error)
+        payload = build_raw_replay(manifest, streams, camera_frames(directory), fps=fps)
+        metadata = manifest.get("metadata") or {}
+        number = metadata.get("session_number")
+        payload.update({
+            "session_id": directory.name,
+            "session_number": number if isinstance(number, int) else 0,
+            "task": metadata.get("task", ""),
+            "state": manifest.get("state", ""),
+            "state_error": stream_error,
+        })
+        while len(cache) >= 4:
+            cache.pop(next(iter(cache)))
+        cache[key] = payload
+        return payload
+
+    async def _lerobot_raw_replay(self, request: Any) -> Any:
+        """Return a pending session as replay frames: features, state and per-camera JPEG names."""
+        from aiohttp import web
+        session_id = request.match_info["session_id"]
+        try:
+            fps = float(request.query.get("fps", "15"))
+        except ValueError:
+            fps = 15.0
+        fps = min(30.0, max(1.0, fps))
+        try:
+            directory = self._session_directory(session_id)
+            payload = await asyncio.to_thread(self._build_raw_replay, directory, fps)
+        except ValueError as error:
+            raise web.HTTPNotFound(text=str(error)) from error
+        return web.json_response(payload)
+
+    async def _lerobot_raw_image(self, request: Any) -> Any:
+        """Serve one raw JPEG frame from an un-exported session's videos tree."""
+        from aiohttp import web
+        session_id = request.match_info["session_id"]
+        camera_id = request.match_info["camera_id"]
+        filename = request.match_info["filename"]
+        if not camera_id or Path(camera_id).name != camera_id:
+            raise web.HTTPNotFound(text="invalid camera id")
+        if (
+            not filename
+            or Path(filename).name != filename
+            or not filename.lower().endswith(".jpg")
+        ):
+            raise web.HTTPNotFound(text="invalid frame")
+        try:
+            directory = self._session_directory(session_id)
+        except ValueError as error:
+            raise web.HTTPNotFound(text=str(error)) from error
+        candidate = (directory / "videos" / camera_id / filename).resolve()
+        if directory not in candidate.parents or not candidate.is_file():
+            raise web.HTTPNotFound(text="frame does not exist")
+        width = _parse_thumbnail_width(request.query.get("w"))
+        if width is not None:
+            try:
+                body = await asyncio.to_thread(_thumbnail_jpeg, candidate, width)
+                return web.Response(
+                    body=body,
+                    content_type="image/jpeg",
+                    headers={"Cache-Control": "no-store"},
+                )
+            except Exception as error:  # noqa: BLE001 - decode failure falls back to the original
+                self._logger.warning(f"raw thumbnail failed, serving original: {error}")
+        return web.FileResponse(candidate, headers={"Cache-Control": "no-store"})
+
+    async def _lerobot_export_all(self, _request: Any) -> Any:
+        """Adopt and queue every pending session for LeRobot conversion at once."""
+        from aiohttp import web
+        if self._export_all is None:
+            raise web.HTTPNotImplemented(text="batch export is not wired to the recorder")
+        try:
+            result = await asyncio.to_thread(self._export_all)
+        except Exception as error:  # noqa: BLE001 - the recorder owns the failure reason
+            self._logger.warning(f"batch export failed: {error}")
+            raise web.HTTPServiceUnavailable(text=str(error)) from error
+        if not isinstance(result, dict) or not result.get("ok"):
+            message = (result or {}).get("message", "batch export failed") if isinstance(result, dict) else "batch export failed"
+            raise web.HTTPConflict(text=message)
+        result.update(await self._meta_sync())
+        return web.json_response(result)
+
+    async def _pika_recalibrate_route(self, _request: Any) -> Any:
+        """Stop Pika, move the libsurvive calibration aside, start again (host helper)."""
+        from aiohttp import web
+        if self._pika_recalibrate is None:
+            return web.json_response({"ok": False, "error": "Pika 重标定未配置"}, status=404)
+        status, payload = await asyncio.to_thread(self._pika_recalibrate)
+        if status != 200:
+            self._logger.warning(f"Pika recalibrate refused/failed ({status}): {payload.get('error')}")
+        return web.json_response(payload, status=status)
+
+    async def _pika_helper_route(self, _request: Any) -> Any:
+        from aiohttp import web
+        if self._pika_helper_status is None:
+            return web.json_response({"configured": False})
+        status, payload = await asyncio.to_thread(self._pika_helper_status)
+        return web.json_response({"configured": True, "reachable": status == 200, **payload})
+
+    async def _lerobot_reindex(self, _request: Any) -> Any:
+        """Re-index episode_index across the dataset (removes orphans, makes contiguous)."""
+        from aiohttp import web
+        try:
+            result = await asyncio.to_thread(
+                reindex_dataset, self._recording_root, self._lerobot_export_dir
+            )
+            result.update(await self._meta_sync())
+            return web.json_response(result)
+        except Exception as error:  # noqa: BLE001 - surface the reindex failure reason
+            self._logger.warning(f"LeRobot reindex failed: {error}")
+            raise web.HTTPConflict(text=str(error)) from error
+
+    async def _meta_sync(self) -> dict[str, Any]:
+        try:
+            index = await asyncio.to_thread(self._tags.rebuild)
+            return {"meta_synced": True, "index_count": len(index["episodes"]), "index_errors": index["errors"]}
+        except Exception as error:
+            self._logger.warning(f"Episode meta sync failed: {error}")
+            return {"meta_synced": False, "meta_error": str(error)}
+
+    async def _lerobot_discard(self, request: Any) -> Any:
+        """Discard one pending session so it is excluded from batch export."""
+        from aiohttp import web
+        session_id = request.match_info["session_id"]
+        try:
+            directory = self._session_directory(session_id)
+            await asyncio.to_thread(SessionStore.discard_final_session, directory)
+        except ValueError as error:
+            raise web.HTTPNotFound(text=str(error)) from error
+        except RuntimeError as error:
+            raise web.HTTPConflict(text=str(error)) from error
+        return web.json_response({"ok": True, **await self._meta_sync()})
+
+    async def _lerobot_queue(self, _request: Any) -> Any:
+        """Return the per-session conversion queue without exposing filesystem paths."""
+        from aiohttp import web
+        try:
+            jobs = await asyncio.to_thread(queue_from_manifests, self._recording_root)
+            return web.json_response({"jobs": jobs})
+        except Exception as error:  # noqa: BLE001 - read-only endpoint must stay available
+            self._logger.warning(f"LeRobot queue listing failed: {error}")
+            raise web.HTTPServiceUnavailable(text="LeRobot queue is unavailable") from error
+
+    def _session_directory(self, session_id: str) -> Path:
+        """Resolve a recording session id to its directory, rejecting traversal.
+
+        Mirrors the ``LeRobotReplayCatalog`` guard so hide/restore can only ever touch
+        a directory directly inside ``self._recording_root``.
+        """
+        if not session_id or Path(session_id).name != session_id:
+            raise ValueError("invalid session id")
+        directory = (self._recording_root / session_id).resolve()
+        if directory.parent != self._recording_root or not directory.is_dir():
+            raise ValueError("session does not exist")
+        return directory
+
+    async def _lerobot_delete(self, request: Any) -> Any:
+        """Soft-hide one exported episode without deleting its raw files."""
+        from aiohttp import web
+        session_id = request.match_info["session_id"]
+        try:
+            directory = self._session_directory(session_id)
+            await asyncio.to_thread(SessionStore.hide_final_session, directory)
+        except ValueError as error:
+            raise web.HTTPNotFound(text=str(error)) from error
+        except RuntimeError as error:
+            raise web.HTTPConflict(text=str(error)) from error
+        return web.json_response({"ok": True, **await self._meta_sync()})
+
+    async def _lerobot_restore(self, request: Any) -> Any:
+        """Re-adopt one previously hidden exported episode."""
+        from aiohttp import web
+        session_id = request.match_info["session_id"]
+        try:
+            directory = self._session_directory(session_id)
+            await asyncio.to_thread(SessionStore.restore_final_session, directory)
+        except ValueError as error:
+            raise web.HTTPNotFound(text=str(error)) from error
+        except RuntimeError as error:
+            raise web.HTTPConflict(text=str(error)) from error
+        return web.json_response({"ok": True, **await self._meta_sync()})
+
+    async def _lerobot_remove(self, request: Any) -> Any:
+        """Permanently delete one exported episode's raw session files.
+
+        This is a hard delete (unlike ``/delete``, which soft-hides the session).
+        """
+        from aiohttp import web
+        session_id = request.match_info["session_id"]
+        try:
+            directory = self._session_directory(session_id)
+            await asyncio.to_thread(SessionStore.remove_final_session, directory)
+        except ValueError as error:
+            raise web.HTTPNotFound(text=str(error)) from error
+        except RuntimeError as error:
+            raise web.HTTPConflict(text=str(error)) from error
+        return web.json_response({"ok": True, **await self._meta_sync()})
+
+    async def _lerobot_trash(self, _request: Any) -> Any:
+        """List soft-deleted exported episodes without exposing filesystem paths."""
+        from aiohttp import web
+        try:
+            sessions = await asyncio.to_thread(self._replay.list_hidden)
+            return web.json_response({"sessions": sessions})
+        except Exception as error:  # noqa: BLE001 - read-only endpoint must stay available
+            self._logger.warning(f"LeRobot trash listing failed: {error}")
+            raise web.HTTPServiceUnavailable(text="LeRobot trash is unavailable") from error
+
+    async def _lerobot_remove_all_hidden(self, _request: Any) -> Any:
+        """Permanently delete every soft-hidden episode's raw session files."""
+        from aiohttp import web
+        try:
+            hidden = await asyncio.to_thread(self._replay.list_hidden)
+            removed = 0
+            for item in hidden:
+                session_id = item.get("session_id")
+                if not session_id:
+                    continue
+                try:
+                    directory = self._session_directory(session_id)
+                    await asyncio.to_thread(SessionStore.remove_final_session, directory)
+                    removed += 1
+                except (ValueError, RuntimeError):
+                    continue
+            return web.json_response({"ok": True, "removed": removed, **await self._meta_sync()})
+        except Exception as error:  # noqa: BLE001 - destructive endpoint must stay available
+            self._logger.warning(f"remove-all-hidden failed: {error}")
+            raise web.HTTPServiceUnavailable(text="remove-all-hidden failed") from error
+
+    async def _lerobot_task(self, request: Any) -> Any:
+        """Set the user-facing task label on one exported episode."""
+        from aiohttp import web
+        session_id = request.match_info["session_id"]
+        try:
+            body = await request.json()
+        except Exception as error:  # noqa: BLE001 - malformed body is a client error
+            raise web.HTTPBadRequest(text="request body must be JSON") from error
+        task = body.get("task") if isinstance(body, dict) else None
+        if not isinstance(task, str) or not task.strip():
+            raise web.HTTPBadRequest(text="task must be a non-empty string")
+        try:
+            directory = self._session_directory(session_id)
+            await asyncio.to_thread(SessionStore.update_task, directory, task)
+        except ValueError as error:
+            raise web.HTTPNotFound(text=str(error)) from error
+        except RuntimeError as error:
+            raise web.HTTPConflict(text=str(error)) from error
+        return web.json_response({"ok": True})
+
+    @staticmethod
+    def _read_subtasks(directory: Path) -> list[dict[str, Any]]:
+        """Return the recorded subtask segments, an empty list when unannotated."""
+        manifest_path = directory / "manifest.json"
+        if not manifest_path.is_file():
+            raise ValueError("recording session has no finalized manifest.json")
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("recording manifest must be a JSON object")
+        subtasks = payload.get("subtasks")
+        return subtasks if isinstance(subtasks, list) else []
+
+    async def _lerobot_subtasks(self, request: Any) -> Any:
+        """Return the current subtask annotation on one exported episode."""
+        from aiohttp import web
+        session_id = request.match_info["session_id"]
+        try:
+            directory = self._session_directory(session_id)
+            subtasks = await asyncio.to_thread(self._read_subtasks, directory)
+        except ValueError as error:
+            raise web.HTTPNotFound(text=str(error)) from error
+        return web.json_response({"subtasks": subtasks})
+
+    async def _lerobot_subtasks_update(self, request: Any) -> Any:
+        """Replace the subtask annotation on one exported episode."""
+        from aiohttp import web
+        session_id = request.match_info["session_id"]
+        try:
+            body = await request.json()
+        except Exception as error:  # noqa: BLE001 - malformed body is a client error
+            raise web.HTTPBadRequest(text="request body must be JSON") from error
+        subtasks = body.get("subtasks") if isinstance(body, dict) else None
+        if not isinstance(subtasks, list):
+            raise web.HTTPBadRequest(text="subtasks must be a list")
+        try:
+            directory = self._session_directory(session_id)
+            await asyncio.to_thread(SessionStore.update_subtasks, directory, subtasks)
+        except ValueError as error:
+            raise web.HTTPNotFound(text=str(error)) from error
+        except RuntimeError as error:
+            raise web.HTTPConflict(text=str(error)) from error
+        return web.json_response({"ok": True})
+
+    async def _quality_get(self, request: Any) -> Any:
+        """Deviation intervals of one finalized session, with frames and the reason list."""
+        from aiohttp import web
+        try:
+            directory = self._session_directory(request.match_info["session_id"])
+            document = await asyncio.to_thread(session_document, directory, self._quality_reasons)
+        except (OSError, ValueError) as error:
+            raise web.HTTPNotFound(text=str(error)) from error
+        return web.json_response(document)
+
+    async def _quality_put(self, request: Any) -> Any:
+        """Replace one session's deviation intervals (compare-and-set on ``revision``)."""
+        from aiohttp import web
+        body = await self._tag_body(request)
+        try:
+            directory = self._session_directory(request.match_info["session_id"])
+        except ValueError as error:
+            raise web.HTTPNotFound(text=str(error)) from error
+        try:
+            await asyncio.to_thread(
+                SessionStore.update_quality_intervals, directory, body.get("intervals"), body.get("revision"),
+                reasons=[reason.id for reason in self._quality_reasons],
+            )
+            document = await asyncio.to_thread(session_document, directory, self._quality_reasons)
+        except QualityConflict as error:
+            raise web.HTTPConflict(text=str(error)) from error
+        except ValueError as error:
+            raise web.HTTPBadRequest(text=str(error)) from error
+        except OSError as error:
+            raise web.HTTPNotFound(text=str(error)) from error
+        return web.json_response(document)
+
+    async def _quality_sidecar(self, request: Any) -> Any:
+        """``episode_quality_events.json`` for one exported dataset, as a download."""
+        from aiohttp import web
+        repo_id = request.query.get("repo_id", "")
+        if "/" not in repo_id:
+            raise web.HTTPBadRequest(text="repo_id must be an owner/dataset identifier")
+        sidecar = await asyncio.to_thread(
+            build_sidecar, self._recording_root, repo_id, generated_at_ns=time.time_ns(),
+        )
+        return web.json_response(
+            sidecar, headers={"Content-Disposition": 'attachment; filename="episode_quality_events.json"'},
+        )
+
+    async def _lerobot_frames(self, request: Any) -> Any:
+        from aiohttp import web
+        try:
+            frames = await asyncio.to_thread(self._replay.frames, request.match_info["session_id"])
+            return web.json_response({"frames": frames})
+        except ValueError as error:
+            raise web.HTTPNotFound(text=str(error)) from error
+        except Exception as error:  # noqa: BLE001 - report SDK/decoder failures to browser
+            self._logger.warning(f"LeRobot replay frame listing failed: {error}")
+            raise web.HTTPServiceUnavailable(text="LeRobot replay is unavailable") from error
+
+    async def _lerobot_summary(self, request: Any) -> Any:
+        from aiohttp import web
+        try:
+            summary = await asyncio.to_thread(self._replay.summary, request.match_info["session_id"])
+            return web.json_response(summary)
+        except ValueError as error:
+            raise web.HTTPNotFound(text=str(error)) from error
+        except Exception as error:  # noqa: BLE001 - isolate SDK failures from live Web state
+            self._logger.warning(f"LeRobot replay summary failed: {error}")
+            raise web.HTTPServiceUnavailable(text="LeRobot replay is unavailable") from error
+
+    async def _lerobot_image(self, request: Any) -> Any:
+        from aiohttp import web
+        try:
+            frame_index = int(request.match_info["frame_index"])
+            image = await asyncio.to_thread(
+                self._replay.image,
+                request.match_info["session_id"],
+                frame_index,
+                request.match_info["camera_id"],
+            )
+        except (ValueError, TypeError) as error:
+            raise web.HTTPNotFound(text=str(error)) from error
+        except Exception as error:  # noqa: BLE001 - decoder failure is isolated to this image
+            self._logger.warning(f"LeRobot replay image failed: {error}")
+            raise web.HTTPServiceUnavailable(text="LeRobot image is unavailable") from error
+        return web.Response(body=image, content_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+    async def _lerobot_video(self, request: Any) -> Any:
+        from aiohttp import web
+        try:
+            path = await asyncio.to_thread(
+                self._replay.video_path,
+                request.match_info["session_id"],
+                request.match_info["camera_id"],
+            )
+        except ValueError as error:
+            raise web.HTTPNotFound(text=str(error)) from error
+        size = (await asyncio.to_thread(path.stat)).st_size
+        rng = _parse_range(request.headers.get("Range"), size)
+        if rng is None:
+            # aiohttp 3.8.1 FileResponse has no Range support; a headerless
+            # request is the only case where the whole-file path is correct.
+            return web.FileResponse(path)
+        start, end = rng
+        resp = web.StreamResponse(
+            status=206,
+            headers={
+                "Content-Type": "video/mp4",
+                "Content-Range": f"bytes {start}-{end}/{size}",
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(end - start + 1),
+            },
+        )
+        await resp.prepare(request)
+        # Video files can be large and the seek/read path may hit slow storage;
+        # keep every file operation off the event loop so concurrent streams do
+        # not contend with WebSocket snapshot broadcasts.
+        source = await asyncio.to_thread(path.open, "rb")
+        try:
+            await asyncio.to_thread(source.seek, start)
+            remaining = end - start + 1
+            while remaining > 0:
+                chunk = await asyncio.to_thread(source.read, min(256 * 1024, remaining))
+                if not chunk:
+                    break
+                await resp.write(chunk)
+                remaining -= len(chunk)
+        finally:
+            await asyncio.to_thread(source.close)
+        await resp.write_eof()
+        return resp
+
+    async def _websocket(self, request: Any) -> Any:
+        from aiohttp import web
+        socket = web.WebSocketResponse(heartbeat=20.0)
+        await socket.prepare(request)
+        self._clients.add(socket)
+        await socket.send_json({"type": "hello", "read_only_robot": True})
+        try:
+            async for message in socket:
+                # Read-only dashboard: the browser never sends commands, so any inbound
+                # text is rejected rather than forwarded to a (nonexistent) control path.
+                if message.type == web.WSMsgType.TEXT:
+                    await socket.send_json(
+                        {
+                            "type": "error",
+                            "code": "read_only_robot",
+                            "message": "recording dashboard is read-only",
+                        }
+                    )
+        finally:
+            self._clients.discard(socket)
+        return socket
+
+    async def _broadcast(self, payload: dict[str, Any]) -> None:
+        encoded = json.dumps(payload, separators=(",", ":"))
+        stale = []
+        # Iterate over a snapshot: a client can connect or drop while `send_str`
+        # yields to the loop, and mutating a set mid-iteration raises RuntimeError
+        # (which, swallowed by the caller's future, would wedge the flush forever).
+        for client in list(self._clients):
+            try:
+                # A browser that cannot drain one small state snapshot promptly is a
+                # preview concern, never a reason to delay other browser clients.
+                await asyncio.wait_for(client.send_str(encoded), timeout=1.0)
+            except Exception:
+                stale.append(client)
+        for client in stale:
+            self._clients.discard(client)

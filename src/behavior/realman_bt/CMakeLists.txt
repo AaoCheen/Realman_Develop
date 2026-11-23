@@ -1,0 +1,348 @@
+cmake_minimum_required(VERSION 3.16)
+project(realman_bt VERSION 0.1.0 LANGUAGES CXX)
+
+find_package(ament_cmake REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(rclcpp_action REQUIRED)
+find_package(rcl_interfaces REQUIRED)
+find_package(realman_msgs REQUIRED)
+find_package(realman_recording_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
+
+set(BT_VENDOR_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/behavior_tree_cpp")
+if(NOT TARGET bt::core)
+  add_subdirectory("${BT_VENDOR_ROOT}/bt_core" "${CMAKE_CURRENT_BINARY_DIR}/bt_core")
+endif()
+
+add_library(input_mode src/input_mode.cpp)
+target_include_directories(input_mode PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_compile_features(input_mode PUBLIC cxx_std_17)
+
+add_library(runtime_snapshot src/runtime_snapshot.cpp)
+target_include_directories(runtime_snapshot PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_compile_features(runtime_snapshot PUBLIC cxx_std_17)
+target_link_libraries(runtime_snapshot PUBLIC bt::core)
+
+add_library(policy_task_core src/policy_task_config.cpp src/policy_supervisor.cpp src/policy_trace.cpp)
+target_include_directories(policy_task_core PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_compile_features(policy_task_core PUBLIC cxx_std_17)
+
+add_library(input_mode_nodes src/input_mode_nodes.cpp)
+target_include_directories(input_mode_nodes PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_compile_features(input_mode_nodes PUBLIC cxx_std_17)
+target_link_libraries(input_mode_nodes PUBLIC
+  input_mode runtime_snapshot bt::core)
+
+add_library(move_j_nodes
+  src/cartesian_velocity_for_duration_node.cpp
+  src/move_j_node.cpp
+  src/rotate_joint_node.cpp
+  src/three_arm_move_j_node.cpp)
+target_include_directories(move_j_nodes PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_compile_features(move_j_nodes PUBLIC cxx_std_17)
+target_link_libraries(move_j_nodes runtime_snapshot bt::core)
+ament_target_dependencies(move_j_nodes
+  geometry_msgs rclcpp rclcpp_action realman_msgs)
+
+add_library(policy_task_nodes
+  src/gripper_ready_node.cpp
+  src/policy_run_node.cpp
+  src/policy_task_params.cpp
+  src/while_grasp_held_node.cpp
+  src/white_objects_remain_node.cpp)
+target_include_directories(policy_task_nodes PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_compile_features(policy_task_nodes PUBLIC cxx_std_17)
+target_link_libraries(policy_task_nodes
+  policy_task_core move_j_nodes runtime_snapshot bt::core)
+ament_target_dependencies(policy_task_nodes
+  rclcpp std_msgs std_srvs sensor_msgs diagnostic_msgs geometry_msgs realman_recording_msgs)
+
+add_library(motion_monitor_nodes src/motion_dwell_monitor_node.cpp)
+target_include_directories(motion_monitor_nodes PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_compile_features(motion_monitor_nodes PUBLIC cxx_std_17)
+target_link_libraries(motion_monitor_nodes runtime_snapshot bt::core)
+ament_target_dependencies(motion_monitor_nodes
+  rclcpp rclcpp_action rcl_interfaces realman_msgs sensor_msgs)
+
+add_library(prepare_keyboard_work_node
+  src/prepare_keyboard_work_node.cpp)
+target_include_directories(prepare_keyboard_work_node PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_compile_features(prepare_keyboard_work_node PUBLIC cxx_std_17)
+target_link_libraries(prepare_keyboard_work_node
+  input_mode move_j_nodes runtime_snapshot bt::core)
+ament_target_dependencies(prepare_keyboard_work_node
+  rclcpp realman_msgs)
+
+install(TARGETS input_mode runtime_snapshot input_mode_nodes
+  EXPORT export_${PROJECT_NAME})
+install(DIRECTORY include/ DESTINATION include)
+add_executable(realman_bt_executor
+  src/main.cpp
+  src/realman_bt_executor_node.cpp)
+target_include_directories(realman_bt_executor PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+  "${BT_VENDOR_ROOT}"
+  "${BT_VENDOR_ROOT}/bt_nodes")
+target_compile_features(realman_bt_executor PRIVATE cxx_std_17)
+target_link_libraries(realman_bt_executor bt::core)
+target_link_libraries(realman_bt_executor runtime_snapshot)
+target_link_libraries(realman_bt_executor move_j_nodes)
+target_link_libraries(realman_bt_executor input_mode_nodes)
+target_link_libraries(realman_bt_executor prepare_keyboard_work_node)
+target_link_libraries(realman_bt_executor policy_task_nodes)
+target_link_libraries(realman_bt_executor motion_monitor_nodes)
+ament_target_dependencies(realman_bt_executor
+  rclcpp rclcpp_action rcl_interfaces realman_msgs std_msgs std_srvs
+  sensor_msgs diagnostic_msgs geometry_msgs)
+install(TARGETS realman_bt_executor DESTINATION lib/${PROJECT_NAME})
+install(PROGRAMS scripts/pika_control_router.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME pika_control_router)
+install(PROGRAMS scripts/keyboard_control_router.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME keyboard_control_router)
+install(PROGRAMS scripts/policy_control_router.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME policy_control_router)
+install(PROGRAMS scripts/bt_launcher.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME bt_launcher)
+# Imported by the routers as `router_common`; it must sit next to them.
+install(PROGRAMS scripts/router_common.py
+  DESTINATION lib/${PROJECT_NAME})
+install(TARGETS move_j_nodes prepare_keyboard_work_node policy_task_nodes policy_task_core
+  motion_monitor_nodes
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin)
+install(DIRECTORY launch DESTINATION share/${PROJECT_NAME} FILES_MATCHING PATTERN "*.py")
+install(FILES
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../config/behavior-trees/move.xml"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../config/behavior-trees/rotate_joint.xml"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../config/behavior-trees/control.xml"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../config/behavior-trees/control_pick.xml"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../config/behavior-trees/three.xml"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../config/behavior-trees/tool_x.xml"
+  DESTINATION share/${PROJECT_NAME}/behavior-trees)
+install(FILES
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../config/ros/realman_coordinates.yaml"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../config/ros/realman_motion.yaml"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../config/ros/pika_config.yaml"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../config/ros/keyboard_control.yaml"
+  DESTINATION share/${PROJECT_NAME}/config/ros)
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_pytest REQUIRED)
+  add_executable(test_input_mode_executor
+    test/test_input_mode_executor.cpp
+    src/realman_bt_executor_node.cpp)
+  target_include_directories(test_input_mode_executor PRIVATE
+    "${BT_VENDOR_ROOT}" "${BT_VENDOR_ROOT}/bt_nodes")
+  target_compile_features(test_input_mode_executor PRIVATE cxx_std_17)
+  target_compile_definitions(test_input_mode_executor PRIVATE
+    BT_TEST_CONFIG_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../../config/behavior-trees")
+  target_link_libraries(test_input_mode_executor
+    move_j_nodes input_mode_nodes prepare_keyboard_work_node policy_task_nodes
+    motion_monitor_nodes)
+  ament_target_dependencies(test_input_mode_executor
+    rclcpp rclcpp_action rcl_interfaces realman_msgs std_msgs std_srvs
+    sensor_msgs diagnostic_msgs geometry_msgs)
+  add_test(NAME test_input_mode_executor COMMAND test_input_mode_executor)
+  set_tests_properties(test_input_mode_executor PROPERTIES
+    TIMEOUT 45
+    ENVIRONMENT "ROS_DOMAIN_ID=217")
+
+  add_executable(test_input_mode test/test_input_mode.cpp)
+  target_link_libraries(test_input_mode PRIVATE input_mode)
+  add_test(NAME test_input_mode COMMAND test_input_mode)
+
+  add_executable(test_input_mode_nodes test/test_input_mode_nodes.cpp)
+  target_include_directories(test_input_mode_nodes PRIVATE
+    "${BT_VENDOR_ROOT}"
+    "${BT_VENDOR_ROOT}/bt_nodes")
+  target_compile_features(test_input_mode_nodes PRIVATE cxx_std_17)
+  target_link_libraries(test_input_mode_nodes PRIVATE input_mode_nodes)
+  add_test(NAME test_input_mode_nodes COMMAND test_input_mode_nodes)
+
+  add_executable(test_runtime_snapshot test/test_runtime_snapshot.cpp)
+  target_include_directories(test_runtime_snapshot PRIVATE
+    "${BT_VENDOR_ROOT}")
+  target_link_libraries(test_runtime_snapshot PRIVATE runtime_snapshot)
+  add_test(NAME test_runtime_snapshot COMMAND test_runtime_snapshot)
+
+  add_executable(test_three_arm_move_j_node test/test_three_arm_move_j_node.cpp)
+  target_link_libraries(test_three_arm_move_j_node move_j_nodes)
+  ament_target_dependencies(test_three_arm_move_j_node rclcpp rclcpp_action realman_msgs)
+  add_test(NAME test_three_arm_move_j_node COMMAND test_three_arm_move_j_node)
+
+  add_executable(test_rotate_joint_node test/test_rotate_joint_node.cpp)
+  target_link_libraries(test_rotate_joint_node move_j_nodes)
+  ament_target_dependencies(test_rotate_joint_node rclcpp rclcpp_action realman_msgs)
+  add_test(NAME test_rotate_joint_node COMMAND test_rotate_joint_node)
+  set_tests_properties(test_rotate_joint_node PROPERTIES
+    TIMEOUT 60 ENVIRONMENT "ROS_DOMAIN_ID=222;ROS_LOCALHOST_ONLY=1")
+
+  add_executable(test_white_objects_remain_node test/test_white_objects_remain_node.cpp)
+  target_include_directories(test_white_objects_remain_node PRIVATE
+    "${BT_VENDOR_ROOT}" "${BT_VENDOR_ROOT}/bt_nodes")
+  target_link_libraries(test_white_objects_remain_node policy_task_nodes)
+  ament_target_dependencies(test_white_objects_remain_node rclcpp sensor_msgs)
+  add_test(NAME test_white_objects_remain_node COMMAND test_white_objects_remain_node)
+  set_tests_properties(test_white_objects_remain_node PROPERTIES
+    TIMEOUT 60 ENVIRONMENT "ROS_DOMAIN_ID=223;ROS_LOCALHOST_ONLY=1")
+
+  add_executable(test_cartesian_velocity_for_duration_node
+    test/test_cartesian_velocity_for_duration_node.cpp)
+  target_link_libraries(test_cartesian_velocity_for_duration_node move_j_nodes)
+  ament_target_dependencies(test_cartesian_velocity_for_duration_node
+    rclcpp rclcpp_action realman_msgs geometry_msgs)
+  add_test(NAME test_cartesian_velocity_for_duration_node
+    COMMAND test_cartesian_velocity_for_duration_node)
+
+  add_executable(test_prepare_keyboard_work_node
+    test/test_prepare_keyboard_work_node.cpp)
+  target_link_libraries(test_prepare_keyboard_work_node
+    prepare_keyboard_work_node)
+  ament_target_dependencies(test_prepare_keyboard_work_node
+    rclcpp realman_msgs)
+  add_test(NAME test_prepare_keyboard_work_node
+    COMMAND test_prepare_keyboard_work_node)
+
+  add_executable(test_terminal_exit_policy test/test_terminal_exit_policy.cpp)
+  target_include_directories(test_terminal_exit_policy PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include")
+  target_compile_features(test_terminal_exit_policy PRIVATE cxx_std_17)
+  add_test(NAME test_terminal_exit_policy COMMAND test_terminal_exit_policy)
+
+  add_executable(test_reactive_control_nodes test/test_reactive_control_nodes.cpp)
+  target_include_directories(test_reactive_control_nodes PRIVATE
+    "${BT_VENDOR_ROOT}"
+    "${BT_VENDOR_ROOT}/bt_nodes")
+  target_compile_features(test_reactive_control_nodes PRIVATE cxx_std_17)
+  target_link_libraries(test_reactive_control_nodes PRIVATE bt::core)
+  add_test(NAME test_reactive_control_nodes COMMAND test_reactive_control_nodes)
+
+  add_executable(test_policy_task_config test/test_policy_task_config.cpp)
+  target_link_libraries(test_policy_task_config PRIVATE policy_task_core)
+  add_test(NAME test_policy_task_config COMMAND test_policy_task_config)
+
+  add_executable(test_policy_supervisor test/test_policy_supervisor.cpp)
+  target_link_libraries(test_policy_supervisor PRIVATE policy_task_core)
+  add_test(NAME test_policy_supervisor COMMAND test_policy_supervisor)
+
+  add_executable(test_policy_trace test/test_policy_trace.cpp)
+  target_link_libraries(test_policy_trace PRIVATE policy_task_core)
+  add_test(NAME test_policy_trace COMMAND test_policy_trace)
+
+  add_executable(test_gripper_ready_node test/test_gripper_ready_node.cpp)
+  target_include_directories(test_gripper_ready_node PRIVATE
+    "${BT_VENDOR_ROOT}" "${BT_VENDOR_ROOT}/bt_nodes")
+  target_link_libraries(test_gripper_ready_node policy_task_nodes)
+  ament_target_dependencies(test_gripper_ready_node rclcpp std_msgs std_srvs)
+  add_test(NAME test_gripper_ready_node COMMAND test_gripper_ready_node)
+  set_tests_properties(test_gripper_ready_node PROPERTIES
+    TIMEOUT 60 ENVIRONMENT "ROS_DOMAIN_ID=218;ROS_LOCALHOST_ONLY=1")
+
+  add_executable(test_while_grasp_held_node test/test_while_grasp_held_node.cpp)
+  target_include_directories(test_while_grasp_held_node PRIVATE
+    "${BT_VENDOR_ROOT}" "${BT_VENDOR_ROOT}/bt_nodes")
+  target_link_libraries(test_while_grasp_held_node policy_task_nodes)
+  ament_target_dependencies(test_while_grasp_held_node rclcpp std_msgs realman_recording_msgs)
+  add_test(NAME test_while_grasp_held_node COMMAND test_while_grasp_held_node)
+  set_tests_properties(test_while_grasp_held_node PROPERTIES
+    TIMEOUT 60 ENVIRONMENT "ROS_DOMAIN_ID=224;ROS_LOCALHOST_ONLY=1")
+
+  add_executable(test_policy_run_node test/test_policy_run_node.cpp)
+  target_include_directories(test_policy_run_node PRIVATE
+    "${BT_VENDOR_ROOT}" "${BT_VENDOR_ROOT}/bt_nodes")
+  target_link_libraries(test_policy_run_node policy_task_nodes)
+  ament_target_dependencies(test_policy_run_node
+    rclcpp std_msgs std_srvs sensor_msgs diagnostic_msgs geometry_msgs realman_recording_msgs)
+  add_test(NAME test_policy_run_node COMMAND test_policy_run_node)
+  set_tests_properties(test_policy_run_node PROPERTIES
+    TIMEOUT 240 ENVIRONMENT "ROS_DOMAIN_ID=219;ROS_LOCALHOST_ONLY=1")
+
+  add_executable(test_policy_task_params test/test_policy_task_params.cpp)
+  target_link_libraries(test_policy_task_params policy_task_nodes)
+  target_compile_definitions(test_policy_task_params PRIVATE
+    POLICY_TASK_CONFIG_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../config/ros/policy_task.yaml")
+  ament_target_dependencies(test_policy_task_params rclcpp)
+  add_test(NAME test_policy_task_params COMMAND test_policy_task_params)
+  set_tests_properties(test_policy_task_params PROPERTIES
+    TIMEOUT 60 ENVIRONMENT "ROS_DOMAIN_ID=220;ROS_LOCALHOST_ONLY=1")
+
+  add_executable(test_dwell_tracker test/test_dwell_tracker.cpp)
+  target_include_directories(test_dwell_tracker PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+  target_compile_features(test_dwell_tracker PRIVATE cxx_std_17)
+  add_test(NAME test_dwell_tracker COMMAND test_dwell_tracker)
+
+  add_executable(test_motion_dwell_monitor_node test/test_motion_dwell_monitor_node.cpp)
+  target_include_directories(test_motion_dwell_monitor_node PRIVATE
+    "${BT_VENDOR_ROOT}" "${BT_VENDOR_ROOT}/bt_nodes")
+  target_link_libraries(test_motion_dwell_monitor_node motion_monitor_nodes)
+  ament_target_dependencies(test_motion_dwell_monitor_node
+    rclcpp rclcpp_action realman_msgs sensor_msgs)
+  add_test(NAME test_motion_dwell_monitor_node COMMAND test_motion_dwell_monitor_node)
+  set_tests_properties(test_motion_dwell_monitor_node PROPERTIES
+    TIMEOUT 120 ENVIRONMENT "ROS_DOMAIN_ID=221;ROS_LOCALHOST_ONLY=1")
+
+  add_executable(test_retry_unless_fault_node test/test_retry_unless_fault_node.cpp)
+  target_include_directories(test_retry_unless_fault_node PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${BT_VENDOR_ROOT}"
+    "${BT_VENDOR_ROOT}/bt_nodes")
+  target_compile_features(test_retry_unless_fault_node PRIVATE cxx_std_17)
+  target_link_libraries(test_retry_unless_fault_node PRIVATE bt::core)
+  add_test(NAME test_retry_unless_fault_node COMMAND test_retry_unless_fault_node)
+
+  ament_add_pytest_test(test_tree_contract test/test_tree_contract.py)
+  ament_add_pytest_test(test_bt_launcher test/test_bt_launcher.py)
+  ament_add_pytest_test(test_control_router_tree test/test_control_router_tree.py)
+  ament_add_pytest_test(test_pika_control_router test/test_pika_control_router.py)
+  ament_add_pytest_test(test_policy_control_router test/test_policy_control_router.py)
+  ament_add_pytest_test(test_keyboard_control_router
+    test/test_keyboard_control_router.py)
+  ament_add_pytest_test(test_pika_config test/test_pika_config.py)
+  ament_add_pytest_test(test_policy_task_config_file test/test_policy_task_config_file.py)
+  ament_add_pytest_test(test_motion_monitor_config_file test/test_motion_monitor_config_file.py)
+  ament_add_pytest_test(test_coordinate_reference_registry
+    test/test_coordinate_reference_registry.py)
+  ament_add_pytest_test(test_cartesian_velocity_tree
+    test/test_cartesian_velocity_tree.py)
+  ament_add_pytest_test(test_launch_module_imports
+    test/test_launch_module_imports.py)
+  ament_add_pytest_test(test_tree_startup_metadata test/test_tree_startup_metadata.py)
+  ament_add_pytest_test(test_arm_move_tree test/test_arm_move_tree.py)
+  ament_add_pytest_test(test_rotate_joint_tree test/test_rotate_joint_tree.py)
+  ament_add_pytest_test(test_control_pick_tree test/test_control_pick_tree.py)
+  ament_add_pytest_test(test_three_arm_move_tree test/test_three_arm_move_tree.py)
+endif()
+
+ament_export_targets(export_${PROJECT_NAME})
+# runtime_snapshot links bt::core through its public interface.  bt_core is
+# vendored into this package, but its CMake install rules also provide a
+# standalone bt_coreConfig.cmake/bt::core target.  Record that package
+# dependency so consumers of find_package(realman_bt) load bt::core before
+# resolving the exported runtime_snapshot target.
+ament_export_dependencies(bt_core)
+ament_package()

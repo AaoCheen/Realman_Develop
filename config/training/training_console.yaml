@@ -1,0 +1,139 @@
+# Training console (src/training/realman_training, design docs/superpowers/specs/2026-10-20-training-console-design.md).
+# Every key is optional; a missing key keeps the default in realman_training/config.py.
+training_console:
+  # Where the pulled recordings, cleaned sets and training views live on server5090.
+  # Host values come from the environment (the untracked env file); unset = the server5090 layout below.
+  data_root: ${REALMAN_TRAINING_DATA_ROOT:-~/data/realman}
+
+  # Per-episode quality rules. The numbers reproduce the 2026-10-13 and 2026-10-16 manual cleanings.
+  quality:
+    # Whose gripper and joints are judged (l, m, r). SJDrealman's Pika data is left-arm: its env file sets l.
+    arm: ${REALMAN_TRAINING_ARM:-r}
+    gripper_open_raw: 50          # right gripper reading fully open (config/ros/gripper.yaml)
+    gripper_close_raw: 8500       # fully closed
+    closed_threshold_raw: 4275    # above = closed; halfway between open and closed
+    # Wide grasps hold the adapter across its body at 3600-4300 (2026-10-16 #216, 17 grasps of 2026-10-26, lifted
+    # on the wrist camera). An episode whose readings never pass wide_grasp_max_raw is judged at
+    # wide_grasp_threshold_raw instead; the rest keep 4275, which a regrasp (reopens to ~3650) or a release cut off by
+    # the end of the recording needs. 4575 = 300 above 4275, so a hold at 4262-4279 does not flicker. The training
+    # view derives the gripper target with the same three numbers.
+    wide_grasp_threshold_raw: 3200
+    wide_grasp_max_raw: 4575
+    start_closed_sec: 1.0         # closed anywhere in this first span = "starts closed"
+    glitch_max_frames: 2          # an open run this short inside a closed run = reading glitch
+    plateau_window_sec: 2.0       # end of the last closed run that is judged for "closed on nothing"
+    # 2 s, not 3: raw 2026-10-16 #209 crept 7400-7600 before settling at 8448 for its last ~2.5 s
+    # (3 s median 7802, kept by mistake); raw #21 (10-13 kept) stays below at 8244 over 2 s.
+    # Recordings have no torque signal: held plateaus reached 7904 on 2026-10-16 (kept), empty grasps
+    # 8414-8550 (dropped). The behaviour tree's 7800 relies on torque and does not apply here.
+    empty_position_min: 8300
+    start_partial_raw: 300        # first reading above this but not closed = warning only
+    release_tasks: [pick_and_place]   # tasks that must end with the gripper open again
+    start_pose_deg: [-9.89, 18.04, 79.08, 15.51, 79.60, -6.20]  # right arm training start pose
+    start_pose_tol_deg: 2.0       # first frame further than this from the start pose = warning only
+
+  # Jobs (one directory each) and other console state. null = <data_root>/_console.
+  state_dir: null
+
+  # Tasks -> prompts. Training views get these unless --task-prompt overrides them; they must equal
+  # policy_bridge's prompt verbatim.
+  prompts:
+    pick_and_place: pick up the power adapter and put it in the blue bin
+    pick_only: pick up the power adapter
+
+  # The recording on realman_ts, pulled from server5090 (files are root 600 on the host, so through the
+  # recording container). Hosts by ssh alias only.
+  remote:
+    ssh_host: ${REALMAN_RECORDING_SSH_HOST-realman_local}   # "" = the recording container runs on this host (SJD)
+    recording_container: realman_pi-realman_recording-1
+    recording_root: /data/realman-recordings/lerobot   # path inside the container
+    dataset: realman__pi05-three-arm
+    connect_timeout_sec: 10
+    lock_wait_sec: 120              # the recorder holds .<dataset>.lock only while appending an episode
+    # The recording platform's tag index (episode_meta.json) and its lock; recording_root must lie under it.
+    tags_root: /data/realman-recordings
+
+  # The GPU host that runs clean/view/norm/train/eval/register (ssh only). "" = run them here (server5090).
+  # On SJDrealman the env file sets these to the campus server; its rules (work dir only, no sudo, never all GPUs)
+  # are in Traning_area/SSH连接说明.md on SJD.
+  compute:
+    ssh_host: ${REALMAN_COMPUTE_SSH_HOST-}
+    ssh_config: ${REALMAN_COMPUTE_SSH_CONFIG-}     # relative = to the repo root
+    workdir: ${REALMAN_COMPUTE_WORKDIR-}           # absolute, on the compute host
+    connect_timeout_sec: 10
+    mirror_sync_sec: 120
+
+  # The openpi checkout and its docker data on server5090.
+  openpi:
+    backend: ${REALMAN_OPENPI_BACKEND-docker}      # uv on a host without docker (EI)
+    env_file: ${REALMAN_OPENPI_ENV_FILE-}
+    default_share_gpus: ${REALMAN_OPENPI_SHARE_GPUS-false}
+    repo: ${REALMAN_OPENPI_REPO:-~/organization/openpi}
+    docker_data: ${REALMAN_OPENPI_DATA:-~/organization/openpi-docker-data}
+    image: openpi:dev
+    compose_project: openpi-console
+    compose_overlay: openpi-console.compose.yaml   # relative = next to this file
+    weights: ${REALMAN_OPENPI_WEIGHTS:-/home/openpi/.cache/openpi/openpi-assets/checkpoints/pi05_base_from_mac/params}
+    gpu_busy_mib: 2000              # more than this used on a GPU = someone else holds it
+    num_workers: 6
+    eval_stride: 10
+
+  # The inference chain (realman-train serve). openpi-serve on this host uses the compose files below with
+  # SERVE_CONFIG/SERVE_CHECKPOINT/SERVE_GPU/OPENPI_POLICY_PORT: the openpi checkout's compose.yaml, then
+  # openpi-serve.compose.yaml (relative = next to this file; runtime: nvidia, the server command), then an optional
+  # overlay ("" = none; SJDrealman: openpi-serve.devices.compose.yaml, GPU without the nvidia runtime).
+  # policy_bridge on the robot host is recreated with `docker compose up -d --no-deps --no-build policy_bridge`
+  # in robot_repo (never ./rm65, never bringup or the behaviour tree) and starts inactive. With a compute host the
+  # served step's params are copied from there first. Host values come from the env file.
+  serving:
+    project: openpi-serve
+    service: openpi
+    compose_files:
+      - ${REALMAN_SERVE_OPENPI_REPO:-~/organization/openpi}/compose.yaml
+      - openpi-serve.compose.yaml
+      - ${REALMAN_SERVE_COMPOSE_OVERLAY-}
+    model: ${REALMAN_SERVE_MODEL:-pi05_realman_multitask_action_only/m_multitask_b16_2gpu}   # <openpi config>/<exp>
+    checkpoint: ""                  # "" = latest numbered checkpoint
+    gpu: ${REALMAN_SERVE_GPU:-2}
+    port: 18000                     # = network.server_port in the robot's config/ros/policy_bridge.yaml
+    container_port: 8000            # inside the container ("server listening on 0.0.0.0:8000"); 0 = same as port
+    start_timeout_sec: 600
+    warmup_rounds: 2                # first inference after a restart JIT-compiles ~26 s
+    warmup_timeout_sec: 180
+    robot_repo: ${REALMAN_ROBOT_REPO:-~/realman_pi}   # on the robot host (realman_ts, or this host when remote.ssh_host is "")
+    bridge_service: policy_bridge
+    bridge_container: realman_pi-policy_bridge-1
+    bridge_config: config/ros/policy_bridge.yaml
+    bridge_start_timeout_sec: 90
+    ros_container: realman_pi-realman_bringup_remote-1
+    ros_setup: source /opt/ros/humble/setup.bash && source /opt/rm65_ws/install/setup.bash
+    server_host: ""                 # "" = the address realman_ts sees in $SSH_CLIENT (never write an IP here)
+    mode_wait_sec: 10
+    policy_modes: [policy]          # start/stop refuse while the behaviour tree is in one of these
+
+  # Data-path checks (realman-train linkcheck). Thresholds from the 2026-10-14..10-19 live runs.
+  linkcheck:
+    pika_node_prefix: pika_         # any such node on the robot graph = the Pika locator floods the Wi-Fi
+    wifi_interface: ""              # "" = first wl* interface on realman_ts
+    wifi_window_sec: 5
+    wifi_max_kb_per_sec: 600
+    bulk_bytes: 16777216            # realman_ts -> server5090 over ssh
+    bulk_min_mb_per_sec: 2.0
+    ping_count: 10
+    ping_size: 1400
+    ping_max_avg_ms: 50
+    ping_max_loss_pct: 5
+    infer_rounds: 5                 # after one untimed round
+    infer_max_ms: 200               # median, two 224x224 images + 7-dim state + prompt
+    stats_timeout_sec: 5
+
+  # The web console (realman-train web; compose service realman_training on server5090, port 8780).
+  # Writes need REALMAN_TRAINING_TOKEN (from the untracked env file passed with --env-file); empty = read-only.
+  web:
+    host: 0.0.0.0
+    port: 8780
+    serve_status_ttl_sec: 20      # serve status = docker inspect + ssh + a ROS probe on realman_ts (~5 s)
+    gpu_ttl_sec: 3
+    log_tail_lines: 200
+    history_limit: 20             # link-check runs listed on the 服务 page
+    passwd_file: /etc/passwd      # uid -> name of GPU holders; the container mounts the host's

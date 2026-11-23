@@ -1,0 +1,530 @@
+<script setup lang="ts">
+import { nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+
+type RobotConfig = {
+  id: "l" | "m" | "r";
+  model: string;
+  expectedMeshCount: number;
+  transform: {
+    x: number;
+    y: number;
+    z: number;
+    roll: number;
+    pitch: number;
+    yaw: number;
+  };
+};
+
+type GripperConfig = {
+  urdf: string;
+  drivingJoint: string;
+  closedRad: number;
+  openRad: number;
+  expectedMeshCount: number;
+};
+
+type EndEffectorMount = {
+  gripper: string;
+  parentLink: string;
+  xyz: [number, number, number];
+  rpy: [number, number, number];
+};
+
+// Shared pedestal under the three bases (config/ros/three_robots.yaml `pedestal`), world frame, visual only.
+type PedestalConfig = {
+  frame: string;
+  centerXy: [number, number];
+  sizeXy: [number, number];
+  topZ: number;
+  bottomZ: number;
+  color: string;
+};
+
+type LayoutConfig = {
+  rootFrame: string;
+  visualizationReferenceArm: "m";
+  defaultJointPosition: number;
+  robots: RobotConfig[];
+  grippers?: Record<string, GripperConfig>;
+  endEffectors?: Partial<Record<RobotConfig["id"], EndEffectorMount>>;
+  pedestal?: PedestalConfig | null;
+};
+
+const canvas = ref<HTMLCanvasElement | null>(null);
+const viewport = ref<HTMLElement | null>(null);
+const state = ref<"loading" | "ready" | "error">("loading");
+const meshCount = ref(0);
+const hasPedestal = ref(false);
+const robotCount = ref(0);
+const modelNames = ref("");
+const rootFrame = ref("world");
+const visualizationReferenceArm = ref("m");
+const animated = ref(false);
+
+// Joint panel. Angles are radians; the sliders show degrees. While an arm is idle its angles
+// follow the animation (so the sliders stay truthful); touching a slider switches that arm to
+// manual and the animation never overwrites the user's pose until "自动" is pressed.
+type ArmId = RobotConfig["id"];
+const armIds: ArmId[] = ["l", "m", "r"];
+const jointCount = 6;
+const selectedArm = ref<ArmId>("l");
+const panelOpen = ref(true);
+const angles = reactive<Record<ArmId, number[]>>({
+  l: Array(jointCount).fill(0),
+  m: Array(jointCount).fill(0),
+  r: Array(jointCount).fill(0),
+});
+const manual = reactive<Record<ArmId, boolean>>({ l: false, m: false, r: false });
+// Gripper opening per arm: 0 = closed, 1 = fully open (same convention as gripper_manager's percentage).
+const hasGripper = ref(false);
+const gripper = reactive<Record<ArmId, number>>({ l: 1, m: 1, r: 1 });
+const manualGripper = reactive<Record<ArmId, boolean>>({ l: false, m: false, r: false });
+const onGripperSlider = (event: Event) => {
+  gripper[selectedArm.value] = Number((event.target as HTMLInputElement).value) / 100;
+  manualGripper[selectedArm.value] = true;
+};
+const limits = reactive<Record<ArmId, { lower: number; upper: number }[]>>({
+  l: Array.from({ length: jointCount }, () => ({ lower: -3.14, upper: 3.14 })),
+  m: Array.from({ length: jointCount }, () => ({ lower: -3.14, upper: 3.14 })),
+  r: Array.from({ length: jointCount }, () => ({ lower: -3.14, upper: 3.14 })),
+});
+const toDegrees = (radians: number) => Math.round((radians * 180) / Math.PI);
+const onSlider = (index: number, event: Event) => {
+  const degrees = Number((event.target as HTMLInputElement).value);
+  angles[selectedArm.value][index] = (degrees * Math.PI) / 180;
+  manual[selectedArm.value] = true;
+};
+const resumeAuto = () => {
+  manual[selectedArm.value] = false;
+  manualGripper[selectedArm.value] = false;
+};
+
+let dispose: (() => void) | undefined;
+let relayout: (() => void) | undefined;
+
+onMounted(async () => {
+  if (!canvas.value || !viewport.value) return;
+  // Open by default only where the scene can keep a decent size next to it; otherwise it starts collapsed.
+  panelOpen.value = window.innerWidth >= 1400;
+
+  try {
+    const base = import.meta.env.BASE_URL;
+    const response = await fetch(`${base}three-robots.json`);
+    if (!response.ok) throw new Error(`Failed to load generated robot config: ${response.status}`);
+    const config = (await response.json()) as LayoutConfig;
+    robotCount.value = config.robots.length;
+    modelNames.value = [...new Set(config.robots.map((robot) => robot.model))].join(" / ");
+    rootFrame.value = config.rootFrame;
+    visualizationReferenceArm.value = config.visualizationReferenceArm;
+
+    const THREE = await import("three");
+    const [{ OrbitControls }, { default: URDFLoader }] = await Promise.all([
+      import("three/examples/jsm/controls/OrbitControls.js"),
+      import("urdf-loader"),
+    ]);
+
+    const host = viewport.value;
+    const renderer = new THREE.WebGLRenderer({
+      canvas: canvas.value,
+      alpha: true,
+      antialias: true,
+      preserveDrawingBuffer: true,
+    });
+    renderer.setClearColor(0x000000, 0);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(34, 1, 0.01, 100);
+    camera.up.set(0, 0, 1);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.055;
+    controls.enablePan = false;
+    controls.minDistance = 0.8;
+    controls.maxDistance = 8;
+    controls.autoRotate = !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    controls.autoRotateSpeed = 0.42;
+
+    scene.add(new THREE.HemisphereLight(0xf6faf8, 0x354248, 2.4));
+    const keyLight = new THREE.DirectionalLight(0xffffff, 4.2);
+    keyLight.position.set(2.2, -2.8, 3.6);
+    keyLight.castShadow = true;
+    scene.add(keyLight);
+
+    const rimLight = new THREE.DirectionalLight(0xd7794c, 2.1);
+    rimLight.position.set(-2.4, 1.8, 2.2);
+    scene.add(rimLight);
+
+    const grid = new THREE.GridHelper(5.4, 27, 0x718087, 0xb8c0bd);
+    grid.rotation.x = Math.PI / 2;
+    grid.position.z = -0.002;
+    const gridMaterial = grid.material as InstanceType<typeof THREE.Material> & {
+      opacity: number;
+      transparent: boolean;
+    };
+    gridMaterial.opacity = 0.3;
+    gridMaterial.transparent = true;
+    scene.add(grid);
+
+    const loader = new URDFLoader();
+    loader.packages = {
+      rm65_description: `${base}models/rm65_description`,
+    };
+    const robotsGroup = new THREE.Group();
+    scene.add(robotsGroup);
+
+    const robotColors: Record<RobotConfig["id"], number[]> = {
+      l: [0x2c8c8f, 0x42a7a4, 0x236d72, 0x9cc8c5, 0xc0d5d0, 0x1c5b61, 0x6e9e9b],
+      m: [0xc76a3e, 0xe18750, 0xa94e2e, 0xe1b092, 0xc7d1cc, 0x86402b, 0xf0c39e],
+      r: [0x48565b, 0x647277, 0x344146, 0x9ca8a5, 0xc8d0cd, 0x273338, 0x7e8b8c],
+    };
+    // Idle choreography: each joint swings gently around a relaxed, bent posture so the arms read as
+    // alive instead of standing rigid at the zero pose. Offsets/amplitudes are radians; the result is
+    // clamped to the URDF joint limits. Arms are phase-shifted so they never move in lockstep.
+    const idleOffset = [0.0, 0.45, 1.05, 0.0, 1.0, 0.0];
+    const idleAmplitude = [0.5, 0.22, 0.3, 0.55, 0.3, 0.7];
+    const idlePeriod = [11, 8, 9.5, 7, 8.5, 6];
+    const armPhase: Record<RobotConfig["id"], number> = { l: 0, m: 2.1, r: 4.2 };
+    // Returns the (limit-clamped) joint values so the panel can mirror them.
+    const idleAngles = (
+      robot: { joints: Record<string, { limit?: { lower: number; upper: number } }> },
+      id: ArmId,
+      seconds: number,
+    ) => idleOffset.map((offset, index) => {
+      const swing = idleAmplitude[index]
+        * Math.sin((2 * Math.PI * seconds) / idlePeriod[index] + armPhase[id] + index * 0.9);
+      const limit = robot.joints[`joint_${index + 1}`]?.limit;
+      const value = offset + swing;
+      // Continuous joints report equal bounds; only clamp real ranges.
+      return limit && limit.upper > limit.lower ? Math.min(Math.max(value, limit.lower), limit.upper) : value;
+    });
+    const applyAngles = (
+      robot: { setJointValue: (name: string, value: number) => unknown },
+      values: number[],
+    ) => values.forEach((value, index) => robot.setJointValue(`joint_${index + 1}`, value));
+    const loadedRobots = await Promise.all(
+      config.robots.map(async (robotConfig) => {
+        const robot = await loader.loadAsync(`${base}models/${robotConfig.model}.urdf`);
+        robot.position.set(
+          robotConfig.transform.x,
+          robotConfig.transform.y,
+          robotConfig.transform.z,
+        );
+        robot.rotation.set(
+          robotConfig.transform.roll,
+          robotConfig.transform.pitch,
+          robotConfig.transform.yaw,
+          "ZYX",
+        );
+        // Start from the relaxed posture (no swing) and publish the real URDF limits to the panel.
+        const id = robotConfig.id;
+        for (let index = 0; index < jointCount; index += 1) {
+          const limit = robot.joints[`joint_${index + 1}`]?.limit;
+          if (limit && limit.upper > limit.lower) limits[id][index] = { lower: limit.lower, upper: limit.upper };
+          angles[id][index] = Math.min(Math.max(idleOffset[index], limits[id][index].lower), limits[id][index].upper);
+        }
+        applyAngles(robot, angles[id]);
+        robotsGroup.add(robot);
+        return { robot, config: robotConfig };
+      }),
+    );
+    const referenceRobot = loadedRobots.find(({ config: robotConfig }) => (
+      robotConfig.id === config.visualizationReferenceArm
+    ));
+    if (!referenceRobot) throw new Error("Generated layout does not define the middle-arm visualization reference");
+    // Rendering is middle-arm-relative only. The generated transforms remain the authoritative TF/world values.
+    const referenceTransform = referenceRobot.config.transform;
+    loadedRobots.forEach(({ robot, config: robotConfig }) => {
+      robot.position.sub(new THREE.Vector3(
+        referenceTransform.x,
+        referenceTransform.y,
+        referenceTransform.z,
+      ));
+    });
+
+    // The pedestal uses the same middle-arm-relative display offset as the arms. With a pedestal the
+    // floor grid moves down to its bottom (the work-table plane) so the grid does not cut through it.
+    const pedestal = config.pedestal;
+    if (pedestal) {
+      const height = pedestal.topZ - pedestal.bottomZ;
+      const pedestalMesh = new THREE.Mesh(
+        new THREE.BoxGeometry(pedestal.sizeXy[0], pedestal.sizeXy[1], height),
+        new THREE.MeshStandardMaterial({ color: pedestal.color, metalness: 0.1, roughness: 0.8 }),
+      );
+      pedestalMesh.name = "pedestal";
+      pedestalMesh.position.set(
+        pedestal.centerXy[0] - referenceTransform.x,
+        pedestal.centerXy[1] - referenceTransform.y,
+        (pedestal.topZ + pedestal.bottomZ) / 2 - referenceTransform.z,
+      );
+      pedestalMesh.castShadow = true;
+      pedestalMesh.receiveShadow = true;
+      scene.add(pedestalMesh);
+      hasPedestal.value = true;
+      grid.position.z = pedestal.bottomZ - referenceTransform.z - 0.002;
+    }
+
+    // Grippers hang off each arm's flange link. Their meshes load asynchronously like the arms'.
+    const loadedGrippers: {
+      id: ArmId;
+      robot: Awaited<ReturnType<typeof loader.loadAsync>>;
+      definition: GripperConfig;
+    }[] = [];
+    await Promise.all(
+      loadedRobots.map(async ({ robot, config: robotConfig }) => {
+        const mount = config.endEffectors?.[robotConfig.id];
+        const definition = mount && config.grippers?.[mount.gripper];
+        if (!mount || !definition) return;
+        const parent = robot.links[mount.parentLink];
+        if (!parent) throw new Error(`Arm ${robotConfig.id} has no link ${mount.parentLink}`);
+        const gripperRobot = await loader.loadAsync(`${base}models/${definition.urdf}`);
+        gripperRobot.position.set(...mount.xyz);
+        gripperRobot.rotation.set(mount.rpy[0], mount.rpy[1], mount.rpy[2], "ZYX");
+        parent.add(gripperRobot);
+        loadedGrippers.push({ id: robotConfig.id, robot: gripperRobot, definition });
+      }),
+    );
+    hasGripper.value = loadedGrippers.length > 0;
+    const setGripper = (id: ArmId, opening: number) => {
+      const entry = loadedGrippers.find((item) => item.id === id);
+      if (!entry) return;
+      const { closedRad, openRad, drivingJoint } = entry.definition;
+      entry.robot.setJointValue(drivingJoint, closedRad + (openRad - closedRad) * opening);
+    };
+    loadedGrippers.forEach(({ id }) => setGripper(id, gripper[id]));
+
+    let modelTimer = 0;
+    const prepareModels = (attempt = 0) => {
+      const meshes = [...loadedRobots, ...loadedGrippers].flatMap(({ robot }) => {
+        const robotMeshes: InstanceType<typeof THREE.Mesh>[] = [];
+        robot.traverse((object) => {
+          if (object instanceof THREE.Mesh) robotMeshes.push(object);
+        });
+        return robotMeshes;
+      });
+
+      const expectedMeshCount = config.robots.reduce((total, robot) => total + robot.expectedMeshCount, 0)
+        + loadedGrippers.reduce((total, { definition }) => total + definition.expectedMeshCount, 0);
+      if (meshes.length < expectedMeshCount) {
+        if (attempt >= 160) {
+          state.value = "error";
+          return;
+        }
+        modelTimer = window.setTimeout(() => prepareModels(attempt + 1), 50);
+        return;
+      }
+
+      loadedRobots.forEach(({ robot, config: robotConfig }) => {
+        const colors = robotColors[robotConfig.id];
+        Object.values(robot.links).forEach((link, index) => {
+          link.traverse((object) => {
+            if (!(object instanceof THREE.Mesh)) return;
+            const source = Array.isArray(object.material) ? object.material[0] : object.material;
+            object.material = new THREE.MeshStandardMaterial({
+              color: colors[index % colors.length],
+              metalness: 0.2,
+              roughness: 0.58,
+              side: source?.side ?? THREE.FrontSide,
+            });
+            object.castShadow = true;
+            object.receiveShadow = true;
+          });
+        });
+      });
+
+      // Grippers use a neutral dark finish so they read as a separate tool from the colored arm links.
+      loadedGrippers.forEach(({ robot }) => {
+        robot.traverse((object) => {
+          if (!(object instanceof THREE.Mesh)) return;
+          object.material = new THREE.MeshStandardMaterial({ color: 0x2b3438, metalness: 0.35, roughness: 0.5 });
+          object.castShadow = true;
+          object.receiveShadow = true;
+        });
+      });
+
+      robotsGroup.updateMatrixWorld(true);
+      const bounds = new THREE.Box3().setFromObject(robotsGroup);
+      const size = bounds.getSize(new THREE.Vector3());
+      const maxDimension = Math.max(size.x, size.y, size.z);
+      const focusHeight = Math.max(bounds.min.z + size.z * 0.48, 0.24);
+      controls.target.set(0, 0, focusHeight);
+      camera.position.set(
+        maxDimension * 1.12,
+        -maxDimension * 1.48,
+        focusHeight + maxDimension * 0.78,
+      );
+      camera.lookAt(controls.target);
+      controls.maxDistance = Math.max(8, maxDimension * 3.2);
+
+      meshCount.value = meshes.length;
+      state.value = "ready";
+    };
+
+    prepareModels();
+
+    const resize = () => {
+      const { width, height } = host.getBoundingClientRect();
+      if (width === 0 || height === 0) return;
+      renderer.setSize(width, height, false);
+      camera.aspect = width / height;
+      camera.zoom = width <= 640 ? 0.82 : 1;
+      if (width > 900) {
+        // Wide screens: the headline is on the left and the joint panel on the right. Fit the scene
+        // into the free band between them (centered, scaled down if the band is narrower than the
+        // arms) so neither the text nor the panel covers the models.
+        const hostBox = host.getBoundingClientRect();
+        const copy = document.querySelector(".hero-copy")?.getBoundingClientRect();
+        const panel = document.querySelector(".joint-panel")?.getBoundingClientRect();
+        const bandLeft = (copy ? copy.right - hostBox.left : width * 0.45) + 12;
+        const bandRight = (panel ? panel.left - hostBox.left : width) - 32;
+        const free = Math.max(bandRight - bandLeft, 240);
+        // At zoom 1 the arms fill the viewer height and swing to ~1.05x that in width at the widest phase.
+        const extent = height * 1.05;
+        camera.zoom = Math.min(Math.max(free / extent, 0.5), 1);
+        const centerX = (bandLeft + Math.max(bandRight, bandLeft + free)) / 2;
+        camera.setViewOffset(width, height, width / 2 - centerX, 0, width, height);
+      } else camera.clearViewOffset();
+      camera.updateProjectionMatrix();
+    };
+    relayout = resize;
+    const resizeObserver = new ResizeObserver(resize);
+    resizeObserver.observe(host);
+    resize();
+
+    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    animated.value = !reducedMotion;
+    // Skip work while the hero is scrolled out of view.
+    let visible = true;
+    const visibility = new IntersectionObserver(([entry]) => { visible = entry.isIntersecting; });
+    visibility.observe(host);
+    const startedAt = performance.now();
+    let frame = 0;
+    let lastPanelSync = 0;
+    const render = (now = performance.now()) => {
+      frame = window.requestAnimationFrame(render);
+      if (!visible) return;
+      if (state.value === "ready") {
+        const seconds = (performance.now() - startedAt) / 1000;
+        const mirror = now - lastPanelSync > 100;
+        if (mirror) lastPanelSync = now;
+        loadedGrippers.forEach(({ id }) => {
+          if (manualGripper[id]) setGripper(id, gripper[id]);
+          else if (!reducedMotion) {
+            // Slow open/close cycle, phase-shifted per arm.
+            const opening = 0.5 + 0.5 * Math.sin((2 * Math.PI * seconds) / 9 + armPhase[id] * 1.3);
+            setGripper(id, opening);
+            if (mirror) gripper[id] = opening;
+          }
+        });
+        loadedRobots.forEach(({ robot, config: robotConfig }) => {
+          const id = robotConfig.id;
+          if (manual[id]) {
+            applyAngles(robot, angles[id]);
+          } else if (!reducedMotion) {
+            const values = idleAngles(robot, id, seconds);
+            applyAngles(robot, values);
+            // Mirror into the reactive state at 10 Hz so the sliders follow without per-frame re-renders.
+            if (mirror) values.forEach((value, index) => { angles[id][index] = value; });
+          }
+        });
+      }
+      controls.update();
+      renderer.render(scene, camera);
+    };
+    render();
+
+    dispose = () => {
+      window.cancelAnimationFrame(frame);
+      window.clearTimeout(modelTimer);
+      resizeObserver.disconnect();
+      visibility.disconnect();
+      controls.dispose();
+      scene.traverse((object) => {
+        if (!(object instanceof THREE.Mesh)) return;
+        object.geometry.dispose();
+        const materials = Array.isArray(object.material) ? object.material : [object.material];
+        materials.forEach((material) => material.dispose());
+      });
+      renderer.dispose();
+    };
+  } catch {
+    state.value = "error";
+  }
+});
+
+// The scene is fitted around the joint panel, so refit whenever the panel opens, closes or appears.
+watch([panelOpen, state], () => nextTick(() => relayout?.()));
+
+onBeforeUnmount(() => dispose?.());
+</script>
+
+<template>
+  <div
+    ref="viewport"
+    class="robot-viewport"
+    :data-state="state"
+    :data-mesh-count="meshCount"
+    :data-pedestal="hasPedestal ? '1' : '0'"
+    :data-robot-count="robotCount"
+    :data-root-frame="rootFrame"
+    :data-visualization-reference-arm="visualizationReferenceArm"
+    :data-animated="animated"
+  >
+    <canvas ref="canvas" aria-label="基于配置的 RM65 三机械臂 URDF 三维模型" role="img" />
+    <div class="model-readout" aria-hidden="true">
+      <span>{{ modelNames || "RM65" }} / {{ robotCount ? "L / M / R" : "..." }}</span>
+      <span>{{ state === "ready" ? "CONFIG / LIVE" : "CONFIG / LOADING" }}</span>
+    </div>
+    <div v-if="state === 'ready'" class="joint-panel" :class="{ collapsed: !panelOpen }">
+      <button class="joint-panel-toggle" type="button" :aria-expanded="panelOpen" @click="panelOpen = !panelOpen">
+        {{ panelOpen ? "收起关节控制" : "关节控制" }}
+      </button>
+      <template v-if="panelOpen">
+        <div class="joint-arms" role="tablist" aria-label="选择机械臂">
+          <button
+            v-for="id in armIds"
+            :key="id"
+            type="button"
+            role="tab"
+            :aria-selected="selectedArm === id"
+            :class="{ active: selectedArm === id, manual: manual[id] || manualGripper[id] }"
+            @click="selectedArm = id"
+          >{{ id.toUpperCase() }}<small>{{ manual[id] || manualGripper[id] ? "手动" : "自动" }}</small></button>
+        </div>
+        <label v-for="index in jointCount" :key="index" class="joint-row">
+          <span class="joint-name">J{{ index }}</span>
+          <input
+            type="range"
+            step="1"
+            :aria-label="`${selectedArm} 臂关节 ${index}`"
+            :min="toDegrees(limits[selectedArm][index - 1].lower)"
+            :max="toDegrees(limits[selectedArm][index - 1].upper)"
+            :value="toDegrees(angles[selectedArm][index - 1])"
+            @input="onSlider(index - 1, $event)"
+          />
+          <span class="joint-value">{{ toDegrees(angles[selectedArm][index - 1]) }}°</span>
+        </label>
+        <label v-if="hasGripper" class="joint-row gripper-row">
+          <span class="joint-name">夹爪</span>
+          <input
+            type="range"
+            min="0"
+            max="100"
+            step="1"
+            :aria-label="`${selectedArm} 臂夹爪开合`"
+            :value="Math.round(gripper[selectedArm] * 100)"
+            @input="onGripperSlider"
+          />
+          <span class="joint-value">{{ Math.round(gripper[selectedArm] * 100) }}%</span>
+        </label>
+        <button class="joint-auto" type="button" :disabled="!manual[selectedArm] && !manualGripper[selectedArm]" @click="resumeAuto">恢复自动摆动</button>
+      </template>
+    </div>
+    <p v-if="state === 'loading'" class="viewer-state">正在加载三机械臂模型</p>
+    <p v-else-if="state === 'error'" class="viewer-state viewer-error">模型预览暂不可用</p>
+  </div>
+</template>

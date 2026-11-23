@@ -1,0 +1,10 @@
+# Transport deps for the vendored OpenPI policy client used by policy_bridge.
+# The client (src/policy_bridge/policy_bridge/inference/openpi_client) speaks the
+# OpenPI WebsocketPolicyServer protocol: msgpack carrying raw NumPy bytes.
+# numpy comes from the ROS python3-numpy dep; it is NOT pinned <2 here because
+# the vendored msgpack_numpy round-trips correctly on numpy 2.x.
+msgpack>=1.0.5
+websockets>=11.0
+# Pillow does the letterbox resize (observation.image_topics[].resize); same library and
+# algorithm as openpi's resize_with_pad, so the images match what the model was trained on.
+Pillow

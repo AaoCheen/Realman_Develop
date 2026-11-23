@@ -1,0 +1,13 @@
+build/
+install/
+log/
+.git/
+.env
+src/.agents/
+src/.codex/
+src/.git/
+src/RM65/
+src/build/
+src/install/
+src/log/
+**/__pycache__/

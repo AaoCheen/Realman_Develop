@@ -1,0 +1,2422 @@
+"""ROS 2 node bridging WebSocket commands to RealMan interfaces."""
+
+from __future__ import annotations
+
+import json
+from functools import wraps
+import math
+import os
+from pathlib import Path
+import queue
+import threading
+import time
+from typing import Any
+from urllib.parse import quote
+
+import yaml
+
+from ament_index_python.packages import get_package_share_directory
+from geometry_msgs.msg import PoseStamped, TwistStamped
+from rcl_interfaces.srv import GetParameters, ListParameters
+import rclpy
+from rclpy.action import ActionClient
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.clock import Clock, ClockType
+from rclpy.duration import Duration
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+from rclpy.time import Time
+from realman_msgs.action import CartesianVelocity, ExecuteMotion, ExecuteTrajectory
+from realman_msgs.msg import CartesianVelocityState, InputModeState, MotionWaypoint
+from realman_recording_msgs.msg import QualityMark, RecordingStatus
+from realman_msgs.srv import (
+    CaptureCalibrationSample,
+    ForwardKinematics,
+    GetCurrentPose,
+    ListInputModes,
+    RecoverMotion,
+    SelectInputMode,
+    SolveCalibration,
+    SolveIk,
+)
+from sensor_msgs.msg import CameraInfo, JointState
+from std_msgs.msg import Bool, Float64, Int32, String
+from std_srvs.srv import SetBool, Trigger
+from gripper_ros2_msgs.msg import GripperLimits
+from gripper_ros2_msgs.srv import GripperPercentage, MoveGripperRaw, SetGripperLimits
+from tf2_ros import Buffer, TransformListener
+
+from .action_bridge import ActionRecord, action_event, assign_fields, message_to_json
+from .input_mode_bridge import InputModeBridge, InputModeEffect, InputModeOption, InputModeSnapshot, MOTION_TYPES
+from .joint_records import JointRecordStore
+from .keyboard_control import KeyboardArmCommand, load_keyboard_control_config
+from .keyboard_control_bridge import KeyboardControlBridge
+from .link_status import LinkSettings, LinkState, RateTracker, arm_specs, build_snapshot, camera_specs, pika_specs
+from .model_manifest import build_manifest
+from .param_readback import ParameterReadback
+from .param_tuning import CatalogError, ParamStore
+from .pika_helper_client import call_helper
+from .pika_switch import PIKA_CLIENT_ID, ModeView, PikaEffect, PikaSwitch, PikaSwitchConfig
+from .protocol import ProtocolError, reject_if_read_only
+from .quality_marks import MARK_KINDS, recording_view, view_changed
+from .tf_pose import transform_stamped_pose
+from .web_server import WebControlServer, load_server_config
+
+
+ARMS = ("l", "m", "r")
+
+
+def _serialized_control(method):
+    """Serialize controller effects and Action ownership, including Future tasks.
+
+    rclpy Future done callbacks may execute outside a client's callback group.
+    The lock therefore covers both command dispatch and response callbacks.
+    """
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        with self._control_lock:
+            return method(self, *args, **kwargs)
+    return call
+
+
+class WebControlNode(Node):
+    """Own ROS clients/subscriptions while aiohttp owns network sockets."""
+
+    def __init__(self) -> None:
+        super().__init__("realman_web_control")
+        package_share = get_package_share_directory("realman_web_control")
+        config_root = Path(
+            os.environ.get("REALMAN_CONFIG_ROOT", str(Path.cwd() / "config"))
+        )
+        description_root = get_package_share_directory("rm65_description")
+        self.declare_parameter(
+            "web_control_config_file",
+            str(config_root / "ros" / "realman_web_control.yaml"),
+        )
+        self.declare_parameter(
+            "layout_config_file",
+            str(config_root / "ros" / "three_robots.yaml"),
+        )
+        self.declare_parameter(
+            "motion_config_file",
+            str(config_root / "ros" / "realman_motion.yaml"),
+        )
+        self.declare_parameter(
+            "coordinates_config_file",
+            str(config_root / "ros" / "realman_coordinates.yaml"),
+        )
+        self.declare_parameter(
+            "keyboard_control_config_file",
+            str(config_root / "ros" / "keyboard_control.yaml"),
+        )
+        self.declare_parameter(
+            "joint_record_dir",
+            str(config_root / "web-control" / "joint-records"),
+        )
+        self.declare_parameter("description_root", description_root)
+        self.declare_parameter("static_root", f"{package_share}/static")
+        self.declare_parameter(
+            "end_effectors_config_file",
+            str(config_root / "ros" / "end_effectors.yaml"),
+        )
+        self.declare_parameter(
+            "policy_task_config_file",
+            str(config_root / "ros" / "policy_task.yaml"),
+        )
+        self.declare_parameter(
+            "quality_reasons_config_file",
+            str(config_root / "recording" / "quality_reasons.yaml"),
+        )
+        self.declare_parameter(
+            "gripper_config_file",
+            str(config_root / "ros" / "gripper.yaml"),
+        )
+        # Read by the topbar link strip (GET /api/links): camera identities and arm addresses.
+        self.declare_parameter(
+            "cameras_config_file",
+            str(config_root / "ros" / "cameras_ros2.yaml"),
+        )
+        self.declare_parameter(
+            "driver_config_file",
+            str(config_root / "ros" / "realman_driver.yaml"),
+        )
+        # Pika sides and pose topics for the link strip (same list the :8770 recorder reads).
+        self.declare_parameter(
+            "recording_config_file",
+            str(config_root / "ros" / "recording.yaml"),
+        )
+        self.declare_parameter(
+            "calibration_config_file",
+            os.environ.get(
+                "REALMAN_CAMERA_CALIBRATION_CONFIG_FILE",
+                f"{os.environ.get('REALMAN_CONFIG_ROOT', '/opt/rm65_ws/config')}/ros/camera_calibration.yaml",
+            ),
+        )
+
+        web_config_file = self._parameter("web_control_config_file")
+        layout_file = self._parameter("layout_config_file")
+        motion_file = self._parameter("motion_config_file")
+        coordinates_file = self._parameter("coordinates_config_file")
+        keyboard_file = self._parameter("keyboard_control_config_file")
+        joint_record_dir = self._parameter("joint_record_dir")
+        description_root = self._parameter("description_root")
+        static_root = self._parameter("static_root")
+        calibration_config_file = self._parameter("calibration_config_file")
+        gripper_config_file = self._parameter("gripper_config_file")
+        calibration_log_root = os.environ.get(
+            "REALMAN_LOG_ROOT", str(config_root.parent / "logs")
+        )
+        web_config = load_server_config(web_config_file)
+        self._manifest = build_manifest(
+            layout_file,
+            motion_file,
+            coordinates_file,
+            keyboard_file,
+            description_root,
+            self._parameter("end_effectors_config_file"),
+            self._parameter("policy_task_config_file"),
+            self._parameter("quality_reasons_config_file"),
+        )
+        self._quality_reason_ids = {reason["id"] for reason in self._manifest["quality_reasons"]}
+        self._robots = {robot["id"]: robot for robot in self._manifest["robots"]}
+        self._keyboard_config = load_keyboard_control_config(
+            keyboard_file, motion_file, coordinates_file
+        )
+        self._keyboard = KeyboardControlBridge(self._keyboard_config)
+        self._keyboard_gripper_publishers = {
+            arm: self.create_publisher(String, f"/keyboard/{arm}/gripper_command",
+                QoSProfile(depth=1, lifespan=Duration(
+                    nanoseconds=self._keyboard_config.input_timeout_ms * 1_000_000)))
+            for arm in ("l", "r")
+        }
+        self._keyboard_publishers = {
+            arm: self.create_publisher(
+                TwistStamped, f"/keyboard/{arm}/cartesian_velocity", 1
+            )
+            for arm in ("l", "r")
+        }
+        self._commands: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue(maxsize=2048)
+        self._control_lock = threading.RLock()
+        self._actions: dict[tuple[str, str], ActionRecord] = {}
+        self._coordinate_state: dict[str, dict[str, Any]] = {}
+        self._camera_health: dict[str, Any] = {"type": "camera_health", "inputs": []}
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self, spin_thread=False)
+        self._tf_frames_by_arm: dict[str, list[dict[str, Any]]] = {arm: [] for arm in ARMS}
+        self._joint_degrees: dict[str, list[float]] = {}
+        self._last_joint_stamp_ns: dict[str, int] = {}
+        self._has_nonzero_joint_state: set[str] = set()
+        self._cartesian_velocity_states: dict[str, dict[str, Any]] = {}
+        self._joint_records = JointRecordStore(joint_record_dir)
+        self._callback_group = ReentrantCallbackGroup()
+        # Node owns its own _subscriptions collection; never append to it twice.
+        self._web_subscriptions = []
+        self._input_modes = InputModeBridge(web_override_timeout_sec=web_config.web_override_timeout_sec)
+        self._pika_helper_url = web_config.pika_helper_url
+        self._pika_helper_timeout = web_config.pika_helper_timeout_sec
+        self._pika_mode_id = web_config.pika_mode
+        self._pika = PikaSwitch(PikaSwitchConfig(
+            input_fresh_ms=web_config.pika_input_fresh_ms,
+            input_wait_timeout_sec=web_config.pika_input_wait_timeout_sec,
+            status_poll_sec=web_config.pika_status_poll_sec,
+            mode_switch_timeout_sec=web_config.pika_mode_switch_timeout_sec,
+            mode=web_config.pika_mode,
+            off_mode=web_config.pika_off_mode,
+            helper_timeout_sec=web_config.pika_helper_timeout_sec,
+            off_mode_timeout_sec=web_config.pika_off_mode_timeout_sec,
+        ), enabled=bool(web_config.pika_helper_url))
+        self._pika_reachable_logged: bool | None = None
+        self._mode_discovery_period = web_config.discovery_period_sec
+        self._mode_list_future = None
+        self._mode_state_subscription = None
+        self._mode_publisher_gid: bytes | None = None
+        self._mode_select_futures: dict[int, Any] = {}
+        self._mode_waiting_selection: InputModeEffect | None = None
+        self._mode_list_client = self.create_client(
+            ListInputModes, "/realman_bt_executor/list_input_modes", callback_group=self._callback_group,
+        )
+        self._mode_select_client = self.create_client(
+            SelectInputMode, "/realman_bt_executor/select_input_mode", callback_group=self._callback_group,
+        )
+        self._grippers = {}
+        self._gripper_clients = {}
+        self._gripper_states = {}
+        self._gripper_bus: dict[str, dict[str, Any]] = {}
+        link_raw = {}
+        try:
+            link_raw = (yaml.safe_load(Path(web_config_file).read_text(encoding="utf-8")) or {}).get("link_status") or {}
+        except Exception as error:
+            self.get_logger().warning(f"link_status config unreadable, using defaults: {error}")
+        self._link_settings = LinkSettings.from_dict(link_raw)
+        self._link_state = LinkState(rates=RateTracker(self._link_settings.rate_window_sec))
+        self._link_state.gripper_states = self._gripper_states
+        try:
+            gripper_cfg = yaml.safe_load(Path(gripper_config_file).read_text(encoding="utf-8")) or {}
+            for bus in gripper_cfg.get("buses", []):
+                for item in bus.get("grippers", []):
+                    name = str(item["name"])
+                    self._grippers[name] = dict(item)
+                    self._gripper_bus[name] = {"port": str(bus.get("port", "")), "baudrate": bus.get("baudrate", "")}
+                    self._gripper_clients[name] = {
+                        "open": self.create_client(Trigger, f"/{name}/open", callback_group=self._callback_group),
+                        "close": self.create_client(Trigger, f"/{name}/close", callback_group=self._callback_group),
+                        "reset": self.create_client(Trigger, f"/{name}/reset", callback_group=self._callback_group),
+                        "grasp_check": self.create_client(Trigger, f"/{name}/grasp_check", callback_group=self._callback_group),
+                        "enable": self.create_client(SetBool, f"/{name}/enable", callback_group=self._callback_group),
+                        "percentage": self.create_client(GripperPercentage, f"/{name}/percentage", callback_group=self._callback_group),
+                        "set_limits": self.create_client(SetGripperLimits, f"/{name}/set_limits", callback_group=self._callback_group),
+                        "move_raw": self.create_client(MoveGripperRaw, f"/{name}/move_raw", callback_group=self._callback_group),
+                    }
+                    self._gripper_states[name] = {"name": name, "connected": False, "position": 0.0, "speed": 0, "current": 0, "torque_reached": False, "alarm": 0}
+                    self._web_subscriptions.extend([
+                        self.create_subscription(Bool, f"/{name}/connected", lambda msg, n=name: self._gripper_state(n, "connected", bool(msg.data)), 10, callback_group=self._callback_group),
+                        self.create_subscription(Float64, f"/{name}/position", lambda msg, n=name: self._gripper_state(n, "position", float(msg.data)), 10, callback_group=self._callback_group),
+                        self.create_subscription(Int32, f"/{name}/speed", lambda msg, n=name: self._gripper_state(n, "speed", int(msg.data)), 10, callback_group=self._callback_group),
+                        self.create_subscription(Int32, f"/{name}/current", lambda msg, n=name: self._gripper_state(n, "current", int(msg.data)), 10, callback_group=self._callback_group),
+                        self.create_subscription(Bool, f"/{name}/torque_reached", lambda msg, n=name: self._gripper_state(n, "torque_reached", bool(msg.data)), 10, callback_group=self._callback_group),
+                        self.create_subscription(Int32, f"/{name}/alarm", lambda msg, n=name: self._gripper_state(n, "alarm", int(msg.data)), 10, callback_group=self._callback_group),
+                        self.create_subscription(String, f"/{name}/link", lambda msg, n=name: self._gripper_link(n, msg), 10, callback_group=self._callback_group),
+                        self.create_subscription(
+                            GripperLimits,
+                            f"/{name}/limits",
+                            lambda msg, n=name: self._gripper_limits(n, msg),
+                            QoSProfile(
+                                depth=1,
+                                reliability=ReliabilityPolicy.RELIABLE,
+                                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                            ),
+                            callback_group=self._callback_group,
+                        ),
+                    ])
+        except Exception as error:
+            self.get_logger().warning(f"Gripper control disabled: {error}")
+
+        self._setup_link_status()
+
+        self._motion_clients = {
+            arm: ActionClient(
+                self,
+                ExecuteMotion,
+                f"/{arm}/execute_motion",
+                callback_group=self._callback_group,
+            )
+            for arm in ARMS
+        }
+        self._velocity_clients = {
+            arm: ActionClient(
+                self,
+                CartesianVelocity,
+                f"/{arm}/cartesian_velocity",
+                callback_group=self._callback_group,
+            )
+            for arm in ARMS
+        }
+        self._trajectory_clients = {
+            arm: ActionClient(
+                self,
+                ExecuteTrajectory,
+                f"/{arm}/execute_trajectory",
+                callback_group=self._callback_group,
+            )
+            for arm in ARMS
+        }
+        self._velocity_publishers = {
+            arm: self.create_publisher(TwistStamped, f"/{arm}/cartesian_velocity/command", 1)
+            for arm in ARMS
+        }
+        self._stop_clients = {
+            arm: self.create_client(
+                Trigger,
+                f"/{arm}/stop",
+                callback_group=self._callback_group,
+            )
+            for arm in ARMS
+        }
+        # Remote Ctrl-C for `./rm65 bt`: the executor halts, drains cancels, then exits.
+        self._bt_shutdown_client = self.create_client(
+            Trigger, "/realman_bt_executor/shutdown", callback_group=self._callback_group,
+        )
+        self._recovery_clients = {
+            arm: self.create_client(
+                RecoverMotion,
+                f"/{arm}/recover_motion",
+                callback_group=self._callback_group,
+            )
+            for arm in ARMS
+        }
+        self._current_pose_clients = {
+            arm: self.create_client(GetCurrentPose, f"/{arm}/get_current_pose", callback_group=self._callback_group)
+            for arm in ARMS
+        }
+        self._fk_clients = {
+            arm: self.create_client(
+                ForwardKinematics,
+                f"/{arm}/forward_kinematics",
+                callback_group=self._callback_group,
+            )
+            for arm in ARMS
+        }
+        self._ik_clients = {
+            arm: self.create_client(SolveIk, f"/{arm}/solve_ik", callback_group=self._callback_group)
+            for arm in ARMS
+        }
+        self._capture_calibration_client = self.create_client(
+            CaptureCalibrationSample,
+            "/camera_calibration/capture_sample",
+            callback_group=self._callback_group,
+        )
+        self._solve_calibration_client = self.create_client(
+            SolveCalibration,
+            "/camera_calibration/solve",
+            callback_group=self._callback_group,
+        )
+        self._web_subscriptions.append(
+            self.create_subscription(
+                String,
+                "/camera_calibration/camera_health",
+                self._camera_health_message,
+                10,
+                callback_group=self._callback_group,
+            )
+        )
+        # Live deviation marks for the recorder (annotation only: never starts a recording) and the
+        # recorder's status, condensed for the page's marking strip.
+        self._wall_clock = Clock(clock_type=ClockType.SYSTEM_TIME)
+        self._quality_mark_publisher = self.create_publisher(QualityMark, "/recording/quality_mark", 50)
+        self._recording_lock = threading.Lock()
+        self._recording_view: dict[str, Any] | None = None
+        self._web_subscriptions.append(
+            self.create_subscription(
+                RecordingStatus,
+                "/recording/status",
+                self._recording_status_message,
+                10,
+                callback_group=self._callback_group,
+            )
+        )
+        for arm in ARMS:
+            self._web_subscriptions.append(
+                self.create_subscription(
+                    JointState,
+                    f"/{arm}/joint_states",
+                    lambda message, selected=arm: self._joint_state(selected, message),
+                    10,
+                    callback_group=self._callback_group,
+                )
+            )
+            self._web_subscriptions.append(
+                self.create_subscription(
+                    String,
+                    f"/{arm}/coordinates/state",
+                    lambda message, selected=arm: self._coordinate_state_message(selected, message),
+                    QoSProfile(
+                        depth=1,
+                        reliability=ReliabilityPolicy.RELIABLE,
+                        durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                    ),
+                    callback_group=self._callback_group,
+                )
+            )
+            self._web_subscriptions.append(
+                self.create_subscription(
+                    Bool,
+                    f"/{arm}/connected",
+                    lambda message, selected=arm: self._connection(selected, message),
+                    10,
+                    callback_group=self._callback_group,
+                )
+            )
+            self._web_subscriptions.append(
+                self.create_subscription(
+                    JointState,
+                    f"/{arm}/joint_currents",
+                    lambda message, selected=arm: self._joint_current_message(selected, message),
+                    10,
+                    callback_group=self._callback_group,
+                )
+            )
+            self._web_subscriptions.append(
+                self.create_subscription(
+                    CartesianVelocityState,
+                    f"/{arm}/cartesian_velocity/state",
+                    lambda message, selected=arm: self._cartesian_velocity_state_message(
+                        selected, message
+                    ),
+                    10,
+                    callback_group=self._callback_group,
+                )
+            )
+
+        param_store, param_store_error, param_reader = None, "", None
+        if web_config.param_catalog_file is not None:
+            try:
+                # Same config root load_server_config resolves the catalog against.
+                param_store = ParamStore(
+                    web_config.param_catalog_file,
+                    Path(web_config_file).resolve().parent.parent,
+                    Path(calibration_log_root) / "param-tuning",
+                )
+            except CatalogError as error:
+                param_store_error = str(error)
+                self.get_logger().error(f"Parameter page disabled: {error}")
+            else:
+                readback_nodes = param_store.readback_requests()
+                param_reader = ParameterReadback(
+                    {
+                        node: self.create_client(
+                            GetParameters, f"{node}/get_parameters", callback_group=self._callback_group,
+                        )
+                        for node in readback_nodes
+                    },
+                    GetParameters.Request,
+                    {
+                        node: self.create_client(
+                            ListParameters, f"{node}/list_parameters", callback_group=self._callback_group,
+                        )
+                        for node in readback_nodes
+                    },
+                    ListParameters.Request,
+                    web_config.param_readback_timeout_sec,
+                ).read
+        self._server = WebControlServer(
+            config=web_config,
+            manifest=self._manifest,
+            static_root=static_root,
+            description_root=description_root,
+            calibration_config_file=calibration_config_file,
+            calibration_log_root=calibration_log_root,
+            on_command=self._enqueue_command,
+            on_client_connected=lambda client_id: self._enqueue_command(client_id, {"type": "client_connected"}),
+            logger=self.get_logger(),
+            param_store=param_store,
+            param_store_error=param_store_error,
+            param_reader=param_reader,
+            link_reader=self._link_snapshot,
+        )
+        self._server.start()
+        self._mode_discovery_timer = self.create_timer(
+            web_config.discovery_period_sec, self._probe_input_modes, callback_group=self._callback_group,
+        )
+        self._tf_timer = self.create_timer(
+            0.5,
+            self._publish_tf_frames,
+            callback_group=self._callback_group,
+        )
+        self._command_timer = self.create_timer(
+            0.02,
+            self._drain_commands,
+            callback_group=self._callback_group,
+        )
+        if self._pika_helper_url:
+            for arm in ("l", "r"):
+                # input_received only stores a float; it skips the control lock so the 20 Hz stream never waits.
+                self._web_subscriptions.append(self.create_subscription(
+                    TwistStamped, f"/pika/{arm}/cartesian_velocity",
+                    lambda _message, arm=arm: self._pika_velocity_received(arm), 1,
+                    callback_group=self._callback_group,
+                ))
+            self._pika_timer = self.create_timer(0.2, self._pika_tick, callback_group=self._callback_group)
+            # First status probe now, so the switch is shown (and `on` is derived) without waiting a poll period.
+            self._apply_pika_effects([PikaEffect("helper", {"action": "status"})])
+        self.get_logger().info(
+            f"RealMan Web control listening on {web_config.bind_host}:{web_config.port} "
+            "(direct control enabled)"
+        )
+
+    def _parameter(self, name: str) -> str:
+        value = self.get_parameter(name).value
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{name} must be a non-empty string")
+        return value
+
+    def _enqueue_command(self, client_id: str, message: dict[str, Any]) -> None:
+        try:
+            self._commands.put_nowait((client_id, message))
+        except queue.Full:
+            self._server.send_event(
+                ProtocolError("server_busy", "command queue is full; try again").event(),
+                client_id,
+            )
+
+    @_serialized_control
+    def _drain_commands(self) -> None:
+        self._retry_web_cancellations()
+        self._apply_input_mode_effects(self._input_modes.expire())
+        self._resume_mode_selection()
+        for _ in range(100):
+            try:
+                client_id, message = self._commands.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                self._dispatch(client_id, message)
+            except ProtocolError as error:
+                self._server.send_event(error.event(), client_id)
+            except Exception as error:
+                self.get_logger().error(
+                    f"Web command {message.get('type', '<unknown>')} failed: {error}"
+                )
+                self._server.send_event(
+                    ProtocolError("internal_error", "command could not be processed").event(),
+                    client_id,
+                )
+
+    @_serialized_control
+    def _dispatch(self, client_id: str, message: dict[str, Any]) -> None:
+        message_type = message["type"]
+        if message_type == "client_connected":
+            self._send_cached_state(client_id)
+        elif message_type == "client_disconnected":
+            self._client_disconnected(client_id)
+        elif message_type == "list_joint_records":
+            self._list_joint_records(client_id, message)
+        elif message_type == "save_joint_record":
+            self._save_joint_record(client_id, message)
+        elif message_type == "delete_joint_record":
+            self._delete_joint_record(client_id, message)
+        elif message_type == "apply_joint_record":
+            self._apply_joint_record(client_id, message)
+        elif message_type == "get_current_pose":
+            self._get_current_pose(client_id, message)
+        elif message_type == "solve_ik":
+            self._solve_ik(client_id, message)
+        elif message_type == "gripper_command":
+            self._gripper_command(client_id, message)
+        elif message_type == "select_input_mode":
+            self._apply_input_mode_effects(self._input_modes.select_mode(client_id, message))
+        elif message_type == "pika_switch":
+            self._apply_pika_effects(self._pika.command(
+                client_id, message["request_id"], message["enabled"], self._pika_mode_view(),
+            ))
+        elif message_type == "keyboard_state":
+            self._keyboard_state(client_id, message)
+        elif message_type in MOTION_TYPES:
+            if not self._input_modes.available:
+                self._apply_input_mode_effects(self._input_modes.update_catalog(
+                    None, confirmed_absent=self._mode_services_absent(),
+                ))
+            self._apply_input_mode_effects(self._input_modes.intercept_motion(client_id, message))
+        elif message_type == "velocity_command":
+            self._velocity_command(client_id, message)
+        elif message_type == "cancel_action":
+            self._cancel_action(client_id, message["arm"], message["action"])
+        elif message_type == "software_stop":
+            self._software_stop(client_id, message)
+        elif message_type == "recover_motion":
+            self._recover_motion(client_id, message)
+        elif message_type == "stop_behavior_tree":
+            self._stop_behavior_tree(client_id, message)
+        elif message_type == "capture_calibration_sample":
+            self._capture_calibration_sample(client_id, message)
+        elif message_type == "solve_calibration":
+            self._solve_calibration(client_id, message)
+        elif message_type == "quality_mark":
+            self._quality_mark(client_id, message)
+        else:
+            raise ProtocolError("unsupported_type", f"unsupported message type: {message_type}")
+
+    def _dispatch_direct_motion(self, client_id: str, message: dict[str, Any]) -> None:
+        handlers = {"execute_motion": self._execute_motion,
+                    "execute_trajectory": self._execute_trajectory,
+                    "start_cartesian_velocity": self._start_velocity}
+        handlers[message["type"]](client_id, message)
+
+    def _mode_services_ready(self) -> bool:
+        return self._mode_list_client.service_is_ready() and self._mode_select_client.service_is_ready()
+
+    def _mode_services_absent(self) -> bool:
+        return not (self._mode_list_client.service_is_ready() or self._mode_select_client.service_is_ready())
+
+    def _refresh_mode_instance(self) -> bool:
+        publishers = self.get_publishers_info_by_topic("/realman_bt_executor/input_mode_state")
+        if len(publishers) != 1:
+            self._input_mode_unavailable(confirmed_absent=self._mode_services_absent())
+            return False
+        gid = bytes(publishers[0].endpoint_gid)
+        if gid != self._mode_publisher_gid:
+            # Service readiness can remain true across a quick restart. The
+            # authoritative state writer identifies the executor incarnation.
+            self._input_mode_unavailable()
+            self._mode_publisher_gid = gid
+        return True
+
+    def _forget_mode_selection_futures(self) -> None:
+        if (self._mode_waiting_selection is not None
+                and self._mode_waiting_selection.token != self._input_modes.pending_token):
+            self._mode_waiting_selection = None
+        for token, future in list(self._mode_select_futures.items()):
+            if token != self._input_modes.pending_token:
+                self._mode_select_futures.pop(token)
+                self._mode_select_client.remove_pending_request(future)
+
+    def _input_mode_unavailable(self, *, confirmed_absent: bool = False) -> None:
+        if self._mode_list_future is not None:
+            future, self._mode_list_future = self._mode_list_future, None
+            self._mode_list_client.remove_pending_request(future)
+        if self._mode_state_subscription is not None:
+            self.destroy_subscription(self._mode_state_subscription)
+            self._mode_state_subscription = None
+        self._apply_input_mode_effects(self._input_modes.update_catalog(
+            None, confirmed_absent=confirmed_absent,
+        ))
+
+    @_serialized_control
+    def _probe_input_modes(self) -> None:
+        self._apply_input_mode_effects(self._input_modes.expire())
+        if not self._mode_services_ready():
+            self._input_mode_unavailable(confirmed_absent=self._mode_services_absent())
+            return
+        if not self._refresh_mode_instance():
+            return
+        if not self._input_modes.available:
+            self._apply_input_mode_effects(self._input_modes.update_catalog(None, confirmed_absent=False))
+        if self._mode_list_future is not None:
+            if time.monotonic() >= self._mode_list_deadline:
+                self.get_logger().warning("Input mode catalog probe timed out")
+                self._input_mode_unavailable()
+            return
+        try:
+            future = self._mode_list_client.call_async(ListInputModes.Request())
+            self._mode_list_future = future
+            self._mode_list_deadline = time.monotonic() + self._mode_discovery_period
+            future.add_done_callback(self._input_mode_catalog_response)
+        except Exception as error:
+            self.get_logger().warning(f"Input mode catalog probe failed: {error}")
+            self._input_mode_unavailable()
+
+    @_serialized_control
+    def _input_mode_catalog_response(self, future: Any) -> None:
+        if future is not self._mode_list_future:
+            return
+        if not self._refresh_mode_instance() or future is not self._mode_list_future:
+            return
+        self._mode_list_future = None
+        if time.monotonic() >= self._mode_list_deadline:
+            self.get_logger().warning("Input mode catalog response arrived after its deadline")
+            self._input_mode_unavailable()
+            return
+        if not self._mode_services_ready():
+            self._input_mode_unavailable(confirmed_absent=self._mode_services_absent())
+            return
+        try:
+            response = future.result()
+            if not response.success:
+                raise ValueError(response.message)
+            if not len(response.mode_ids) == len(response.labels) == len(response.selectable):
+                raise ValueError("input mode catalog arrays have different lengths")
+            options = tuple(InputModeOption(mode_id, label, selectable)
+                            for mode_id, label, selectable in zip(response.mode_ids, response.labels, response.selectable))
+            previous_generation = self._input_modes.generation
+            self._apply_input_mode_effects(self._input_modes.update_catalog(options))
+            if previous_generation != self._input_modes.generation:
+                self._subscribe_input_mode_state()
+        except Exception as error:
+            self.get_logger().warning(f"Input mode catalog response failed: {error}")
+            self._input_mode_unavailable()
+
+    @_serialized_control
+    def _input_mode_selection_response(self, token: int, future: Any) -> None:
+        if self._mode_select_futures.get(token) is not future:
+            return
+        if not self._refresh_mode_instance() or self._mode_select_futures.get(token) is not future:
+            return
+        self._mode_select_futures.pop(token)
+        if not self._mode_services_ready():
+            self._input_mode_unavailable(confirmed_absent=self._mode_services_absent())
+            return
+        try:
+            response = future.result()
+            effects = self._input_modes.selection_response(token, bool(response.accepted), int(response.request_id), response.message)
+        except Exception as error:
+            self.get_logger().warning(f"Input mode selection failed: {error}")
+            effects = self._input_modes.selection_response(token, False, 0, str(error))
+        self._apply_input_mode_effects(effects)
+
+    def _subscribe_input_mode_state(self) -> None:
+        generation = self._input_modes.generation
+        publisher_gid = self._mode_publisher_gid
+        self._mode_state_subscription = self.create_subscription(
+            InputModeState, "/realman_bt_executor/input_mode_state",
+            lambda message: self._input_mode_state(
+                message, publisher_gid=publisher_gid, generation=generation),
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                       durability=DurabilityPolicy.TRANSIENT_LOCAL),
+            callback_group=self._callback_group,
+        )
+
+    @_serialized_control
+    def _input_mode_state(self, message: InputModeState, *, publisher_gid: bytes | None = None,
+                          generation: int | None = None) -> None:
+        if not self._refresh_mode_instance():
+            return
+        if (not self._input_modes.available or
+                (generation is not None and generation != self._input_modes.generation) or
+                (publisher_gid is not None and publisher_gid != self._mode_publisher_gid)):
+            return
+        if self._input_modes.available and not self._mode_services_ready():
+            self._input_mode_unavailable(confirmed_absent=self._mode_services_absent())
+            return
+        phases = {InputModeState.ACTIVE: "ACTIVE", InputModeState.SWITCHING: "SWITCHING", InputModeState.FAILED: "FAILED"}
+        phase = phases.get(message.phase)
+        if phase is None:
+            self.get_logger().warning(f"Ignoring unknown input mode phase: {message.phase}")
+            return
+        snapshot = InputModeSnapshot(message.requested_mode, message.selected_mode, message.active_mode,
+                                     phase, int(message.request_id), int(message.epoch), message.detail)
+        self._apply_input_mode_effects(self._input_modes.update_state(snapshot))
+
+    def _cancel_web_actions(self) -> None:
+        records = list(self._actions.values())
+        for record in records:
+            record.cancel_requested = True
+        for record in records:
+            if record.goal_handle is not None:
+                try:
+                    self._request_cancel(record)
+                except Exception as error:
+                    self.get_logger().error(f"Web input mode cancel failed for {record.arm}/{record.action}: {error}")
+                    self._server.send_event(action_event(record, "error", message=str(error)))
+
+    def _resume_mode_selection(self) -> None:
+        effect = self._mode_waiting_selection
+        if effect is not None and not any(not record.cancel_submitted for record in self._actions.values()):
+            self._mode_waiting_selection = None
+            self._apply_input_mode_effects([effect])
+
+    def _apply_input_mode_effects(self, effects: list[InputModeEffect]) -> None:
+        for effect in effects:
+            if effect.kind == "send_event":
+                if effect.client_id == PIKA_CLIENT_ID:
+                    # Replies to the Pika switch's own requests; PIKA_CLIENT_ID is not a browser.
+                    payload = effect.payload
+                    if payload.get("type") == "input_mode_result":
+                        self._apply_pika_effects(self._pika.mode_request_result(
+                            payload["request_id"], bool(payload["accepted"]),
+                            int(payload["executor_request_id"]), str(payload.get("message", "")),
+                        ))
+                    elif payload.get("type") == "error" and payload.get("request_id"):
+                        self._apply_pika_effects(self._pika.mode_request_error(
+                            payload["request_id"], str(payload.get("code", "")), str(payload.get("message", "")),
+                        ))
+                    else:
+                        self.get_logger().debug(f"Pika switch: dropped input-mode event {payload.get('type')}")
+                    continue
+                self._server.send_event(effect.payload, effect.client_id)
+            elif effect.kind == "cancel_web_actions":
+                self._cancel_web_actions()
+            elif effect.kind == "request_mode":
+                if not self._refresh_mode_instance():
+                    continue
+                if effect.token != self._input_modes.pending_token:
+                    continue
+                if (effect.payload["mode_id"] != "web"
+                        and any(not record.cancel_submitted for record in self._actions.values())):
+                    self._mode_waiting_selection = effect
+                    continue
+                if not self._mode_services_ready():
+                    self._input_mode_unavailable(confirmed_absent=self._mode_services_absent())
+                    return
+                self._forget_mode_selection_futures()
+                request = SelectInputMode.Request()
+                request.mode_id = effect.payload["mode_id"]
+                request.requester_id = f"web:{effect.client_id}:{effect.token}"
+                try:
+                    future = self._mode_select_client.call_async(request)
+                    self._mode_select_futures[effect.token] = future
+                    future.add_done_callback(lambda completed, token=effect.token: self._input_mode_selection_response(token, completed))
+                except Exception as error:
+                    self.get_logger().warning(f"Input mode selection submission failed: {error}")
+                    self._apply_input_mode_effects(self._input_modes.selection_response(effect.token, False, 0, str(error)))
+            elif effect.kind == "forward_motion":
+                try:
+                    if self._input_modes.available and not self._mode_services_ready():
+                        self._input_mode_unavailable(confirmed_absent=self._mode_services_absent())
+                        raise ProtocolError("input_mode_unavailable", "input mode router is unavailable", effect.payload["request_id"])
+                    self._dispatch_direct_motion(effect.client_id, effect.payload)
+                except ProtocolError as error:
+                    self._server.send_event(error.event(), effect.client_id)
+                except Exception as error:
+                    self.get_logger().error(f"Web motion dispatch failed: {error}")
+                    self._server.send_event(ProtocolError("internal_error", str(error), effect.payload["request_id"]).event(), effect.client_id)
+            elif effect.kind == "keyboard_lease":
+                if effect.payload["active"]:
+                    self._keyboard.activate(effect.client_id)
+                else:
+                    self._keyboard.deactivate()
+                self._server.send_event(
+                    {"type": "keyboard_lease", "active": bool(effect.payload["active"])},
+                    effect.client_id,
+                )
+            elif effect.kind == "keyboard_zero":
+                self._publish_keyboard_zeros()
+            elif effect.kind == "request_safe_mode":
+                self._request_keyboard_safe_mode()
+        self._forget_mode_selection_futures()
+
+    def _pika_velocity_received(self, arm: str) -> None:
+        self._pika.input_received(arm)
+        self._link_state.rates.record(f"pika_velocity/{arm}")
+
+    def _pika_mode_view(self) -> ModeView:
+        snapshot = self._input_modes.snapshot
+        return ModeView(
+            available=self._input_modes.available,
+            selectable=self._input_modes.is_selectable(self._pika_mode_id),
+            phase=snapshot.phase if snapshot is not None else None,
+            requested_mode=snapshot.requested_mode if snapshot is not None else "",
+            active_mode=snapshot.active_mode if snapshot is not None else "",
+            detail=snapshot.detail if snapshot is not None else "",
+            request_id=snapshot.request_id if snapshot is not None else 0,
+        )
+
+    @_serialized_control
+    def _pika_tick(self) -> None:
+        self._apply_pika_effects(self._pika.tick(self._pika_mode_view()))
+
+    @_serialized_control
+    def _pika_helper_done(self, action: str, ok: bool, payload: dict[str, Any], *,
+                          epoch: int | None = None) -> None:
+        if not ok and action != "status":
+            self.get_logger().warning(f"Pika helper {action} failed: {payload.get('error', '')}")
+        self._apply_pika_effects(self._pika.helper_result(action, ok, payload, epoch=epoch))
+        reachable = self._pika.reachable
+        if reachable != self._pika_reachable_logged:
+            # Logged once per change; status polls every few seconds would flood the log otherwise.
+            self._pika_reachable_logged = reachable
+            if reachable:
+                self.get_logger().info(f"Pika helper reachable at {self._pika_helper_url}")
+            else:
+                self.get_logger().warning(f"Pika helper not reachable: {payload.get('error', '')}")
+
+    def _run_pika_helper(self, action: str, epoch: int | None) -> None:
+        """Helper thread body: the switch must always get an answer, or it stays in a transition."""
+        try:
+            ok, payload = call_helper(self._pika_helper_url, action, self._pika_helper_timeout)
+        except Exception as error:  # noqa: BLE001 - call_helper should not raise; never lose the answer
+            self.get_logger().error(f"Pika helper {action} call raised: {error!r}")
+            ok, payload = False, {"ok": False, "error": f"Pika helper call failed: {type(error).__name__}: {error}"}
+        try:
+            self._pika_helper_done(action, ok, payload, epoch=epoch)
+        except Exception as error:  # noqa: BLE001 - a daemon thread has nobody else to report to
+            self.get_logger().error(f"Pika switch: applying helper {action} result failed: {error!r}")
+
+    def _apply_pika_effects(self, effects: list[PikaEffect]) -> None:
+        """Apply switch effects in order; callers hold the control lock (helper calls run in threads)."""
+        for effect in effects:
+            if effect.kind in ("send_event", "reply_error"):
+                # client_id None broadcasts; a requester-only state answer and errors carry the client.
+                self._server.send_event(effect.payload, effect.client_id)
+            elif effect.kind == "helper":
+                action = effect.payload["action"]
+                if action != "status":
+                    self.get_logger().info(f"Pika switch: helper {action}")
+                epoch = effect.payload.get("epoch")
+                threading.Thread(
+                    target=self._run_pika_helper, args=(action, epoch),
+                    name=f"pika-helper-{action}", daemon=True,
+                ).start()
+            elif effect.kind == "select_mode":
+                self.get_logger().info(f"Pika switch: select input mode {effect.payload['mode_id']}")
+                self._apply_input_mode_effects(self._input_modes.select_mode(
+                    PIKA_CLIENT_ID,
+                    {"mode_id": effect.payload["mode_id"], "request_id": effect.payload["request_id"]},
+                ))
+            else:
+                self.get_logger().error(f"Pika switch: unknown effect {effect.kind}")
+
+    def _keyboard_work_available(self, arm: str) -> bool:
+        state = self._coordinate_state.get(arm, {})
+        arm_config = self._keyboard_config.arms[arm]
+        work = state.get("work")
+        return bool(
+            state.get("motion_allowed") is True
+            and state.get("work_matched") is True
+            and state.get("current_work") == arm_config.reference_name
+            and state.get("expected_work") == arm_config.reference_name
+            and isinstance(work, dict)
+            and work.get("name") == arm_config.reference_name
+            and work.get("frame_id") == arm_config.frame_id
+        )
+
+    def _keyboard_state(self, client_id: str, message: dict[str, Any]) -> None:
+        snapshot = self._input_modes.keyboard_snapshot(client_id)
+        command = self._keyboard.command(client_id, message)
+        gripper_error = None
+        if command.gripper_command is not None:
+            name = {"l": "gripper_left", "r": "gripper_right"}[command.arm]
+            state = self._gripper_states.get(name, {})
+            if state.get("connected") is not True or state.get("alarm") != 0:
+                gripper_error = ProtocolError("keyboard_gripper_unavailable", f"{name} gripper is offline or alarmed")
+            else:
+                # Discrete press edge; the BT router owns dry-run and mode gates.
+                # Never publish a release value: 0.0 means FULL CLOSE, not stop.
+                event = String(data=json.dumps({
+                    "command": command.gripper_command,
+                    "epoch": snapshot.epoch, "request_id": snapshot.request_id,
+                    "stamp_ns": self.get_clock().now().nanoseconds,
+                }))
+                self._keyboard_gripper_publishers[command.arm].publish(event)
+        nonzero = any(command.linear) or any(command.angular)
+        if nonzero and not self._keyboard_work_available(command.arm):
+            self._publish_keyboard_command(self._keyboard_config.command(command.arm, frozenset()))
+            raise ProtocolError(
+                "keyboard_work_unavailable",
+                f"{command.arm} default WORK reference is unavailable",
+            )
+        self._publish_keyboard_command(command)
+        if gripper_error is not None:
+            raise gripper_error
+
+    def _publish_keyboard_command(self, command: KeyboardArmCommand) -> None:
+        message = TwistStamped()
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.header.frame_id = command.frame_id
+        message.twist.linear.x, message.twist.linear.y, message.twist.linear.z = command.linear
+        message.twist.angular.x, message.twist.angular.y, message.twist.angular.z = command.angular
+        self._keyboard_publishers[command.arm].publish(message)
+
+    def _publish_keyboard_zeros(self) -> None:
+        for arm in ("l", "r"):
+            self._publish_keyboard_command(
+                self._keyboard_config.command(arm, frozenset())
+            )
+
+    def _request_keyboard_safe_mode(self) -> None:
+        request = SelectInputMode.Request()
+        request.mode_id = "none"
+        request.requester_id = "web:keyboard-disconnect"
+        try:
+            self._mode_select_client.call_async(request)
+        except Exception as error:
+            self.get_logger().warning(
+                f"Keyboard safe-mode request failed: {error}"
+            )
+
+    def _gripper_state(self, name: str, field: str, value: Any) -> None:
+        state = self._gripper_states.get(name)
+        if state is None:
+            return
+        state[field] = value
+        event = {"type": "gripper_state", **state}
+        self._server.send_event(event)
+
+    def _setup_link_status(self) -> None:
+        """Subscriptions behind the topbar link strip: camera_info rates and driver /connected."""
+        try:
+            self._link_cameras = camera_specs(self._parameter("cameras_config_file"))
+        except Exception as error:
+            self.get_logger().warning(f"link strip: no camera list ({error})")
+            self._link_cameras = []
+        self._link_arms = arm_specs(self._parameter("driver_config_file"), self._link_settings.arms)
+        rates = self._link_state.rates
+        for camera in self._link_cameras:
+            # camera_info rides with every frame and is tiny, so the rate costs no image copies.
+            self._web_subscriptions.append(self.create_subscription(
+                CameraInfo, camera.info_topic,
+                lambda _msg, key=f"camera/{camera.camera_id}": rates.record(key),
+                qos_profile_sensor_data, callback_group=self._callback_group,
+            ))
+        try:
+            self._link_pikas = pika_specs(self._parameter("recording_config_file"))
+        except Exception as error:
+            self.get_logger().warning(f"link strip: no Pika list ({error})")
+            self._link_pikas = []
+        for pika in self._link_pikas:
+            if pika.pose_topic:
+                self._web_subscriptions.append(self.create_subscription(
+                    PoseStamped, pika.pose_topic,
+                    lambda _msg, key=f"pika_pose/{pika.side}": rates.record(key),
+                    qos_profile_sensor_data, callback_group=self._callback_group,
+                ))
+        self._web_subscriptions.extend([
+            self.create_subscription(
+                Bool, "/foot_pedal/enabled",
+                lambda msg: self._link_state.set_value("pika/keyboard_enabled", bool(msg.data)),
+                10, callback_group=self._callback_group,
+            ),
+            self.create_subscription(
+                String, "/pika_episode/state", self._pika_episode_state, 10, callback_group=self._callback_group,
+            ),
+        ])
+        for arm in self._link_settings.arms:
+            self._web_subscriptions.append(self.create_subscription(
+                Bool, f"/{arm}/connected",
+                lambda msg, selected=arm: self._link_state.set_arm_connected(selected, bool(msg.data)),
+                10, callback_group=self._callback_group,
+            ))
+
+    def _pika_episode_state(self, message: String) -> None:
+        try:
+            payload = json.loads(message.data)
+        except json.JSONDecodeError:
+            return
+        if isinstance(payload, dict):
+            self._link_state.set_value("pika/episode", payload)
+
+    def _gripper_link(self, name: str, message: String) -> None:
+        try:
+            payload = json.loads(message.data)
+        except json.JSONDecodeError:
+            return
+        if isinstance(payload, dict):
+            self._link_state.set_gripper_link(name, payload)
+
+    def _link_snapshot(self) -> dict[str, Any]:
+        """GET /api/links (aiohttp thread): every arm, camera and gripper link, read now."""
+        return build_snapshot(
+            state=self._link_state,
+            settings=self._link_settings,
+            arms=self._link_arms,
+            cameras=self._link_cameras,
+            grippers=self._grippers,
+            gripper_bus=self._gripper_bus,
+            pikas=self._link_pikas,
+            pika_switch=self._pika.state_event(),
+        )
+
+    def _gripper_limits(self, name: str, message: GripperLimits) -> None:
+        item = self._grippers.get(name)
+        if item is None:
+            return
+        item.update(
+            open_position=int(message.open_position),
+            close_position=int(message.close_position),
+            min_position=int(message.min_position),
+            max_position=int(message.max_position),
+        )
+        self._server.send_event({"type": "gripper_list", "grippers": list(self._grippers.values())})
+
+    def _gripper_command(self, client_id: str, message: dict[str, Any]) -> None:
+        name, command, request_id = message["name"], message["command"], message["request_id"]
+        reject_if_read_only(command, self._server.read_only, request_id)
+        clients = self._gripper_clients.get(name)
+        if clients is None:
+            raise ProtocolError("gripper_unavailable", f"unknown gripper {name}", request_id)
+        if command in {"disable", "enable"}:
+            client = clients["enable"]
+            request = SetBool.Request()
+            request.data = command == "enable"
+        elif command == "percentage":
+            client = clients["percentage"]
+            request = GripperPercentage.Request()
+            request.percentage = float(message["percentage"])
+        elif command == "set_limits":
+            client = clients["set_limits"]
+            request = SetGripperLimits.Request()
+            request.open_position = int(message["open_position"])
+            request.close_position = int(message["close_position"])
+        elif command == "move_raw":
+            client = clients["move_raw"]
+            request = MoveGripperRaw.Request()
+            request.position = int(message["position"])
+        else:
+            client = clients[command]
+            request = Trigger.Request()
+        if not client.service_is_ready():
+            raise ProtocolError("gripper_unavailable", f"/{name}/{command} is not available", request_id)
+        future = client.call_async(request)
+        future.add_done_callback(lambda completed: self._gripper_result(client_id, name, command, request_id, completed))
+        self._server.send_event({"type": "gripper_result", "name": name, "command": command, "request_id": request_id, "state": "requested"}, client_id)
+
+    def _gripper_result(self, client_id: str, name: str, command: str, request_id: str, future: Any) -> None:
+        try:
+            response = future.result()
+            event = {"type": "gripper_result", "name": name, "command": command, "request_id": request_id, "success": bool(response.success), "message": response.message, "state": "completed"}
+        except Exception as error:
+            event = {"type": "gripper_result", "name": name, "command": command, "request_id": request_id, "success": False, "message": str(error), "state": "failed"}
+        self._server.send_event(event, client_id)
+
+    def _capture_calibration_sample(self, client_id: str, message: dict[str, Any]) -> None:
+        client = self._capture_calibration_client
+        if not client.service_is_ready():
+            raise ProtocolError(
+                "calibration_unavailable",
+                "/camera_calibration/capture_sample is not available",
+                message["request_id"],
+            )
+        request = CaptureCalibrationSample.Request()
+        request.session_id = message["session_id"]
+        request.start_new_session = message["start_new_session"]
+        request.arm_ids = message["arm_ids"]
+        future = client.call_async(request)
+        future.add_done_callback(
+            lambda completed: self._calibration_capture_response(
+                client_id, message["request_id"], completed
+            )
+        )
+
+    def _calibration_capture_response(self, client_id: str, request_id: str, future: Any) -> None:
+        try:
+            response = future.result()
+            event = {
+                "type": "calibration_capture_result",
+                "request_id": request_id,
+                "success": bool(response.success),
+                "session_id": response.session_id,
+                "batch_id": response.batch_id,
+                "captured_arm_ids": list(response.captured_arm_ids),
+                "sample_counts": list(response.sample_counts),
+                "sample_ids": list(response.sample_ids),
+                "image_paths": list(response.image_paths),
+                "preview_image_paths": [
+                    self._calibration_preview_url(path)
+                    for path in response.preview_image_paths
+                ],
+                "latest_image_paths": [
+                    self._calibration_preview_url(path)
+                    for path in response.latest_image_paths
+                ],
+                "detection_statuses": list(response.detection_statuses),
+                "detection_messages": list(response.detection_messages),
+                "message": response.message,
+            }
+        except Exception as error:
+            self.get_logger().error(f"Web calibration capture failed: {error}")
+            event = {
+                "type": "calibration_capture_result",
+                "request_id": request_id,
+                "success": False,
+                "session_id": "",
+                "batch_id": "",
+                "captured_arm_ids": [],
+                "sample_counts": [],
+                "sample_ids": [],
+                "image_paths": [],
+                "preview_image_paths": [],
+                "latest_image_paths": [],
+                "detection_statuses": [],
+                "detection_messages": [],
+                "message": str(error),
+            }
+        self._server.send_event(event, client_id)
+
+    def _calibration_preview_url(self, path: str) -> str:
+        root = Path(os.environ.get("REALMAN_LOG_ROOT", "/opt/rm65_ws/logs")).resolve()
+        candidate = Path(path).resolve()
+        try:
+            relative = candidate.relative_to(root)
+        except ValueError:
+            return ""
+        return "/api/calibration/preview/" + quote(relative.as_posix(), safe="/")
+
+    def _solve_calibration(self, client_id: str, message: dict[str, Any]) -> None:
+        client = self._solve_calibration_client
+        if not client.service_is_ready():
+            raise ProtocolError(
+                "calibration_unavailable",
+                "/camera_calibration/solve is not available",
+                message["request_id"],
+            )
+        request = SolveCalibration.Request()
+        request.session_id = message["session_id"]
+        future = client.call_async(request)
+        future.add_done_callback(
+            lambda completed: self._calibration_solve_response(
+                client_id, message["request_id"], completed
+            )
+        )
+
+    def _calibration_solve_response(self, client_id: str, request_id: str, future: Any) -> None:
+        try:
+            response = future.result()
+            event = {
+                "type": "calibration_solve_result",
+                "request_id": request_id,
+                "success": bool(response.success),
+                "all_arms_solved": bool(response.all_arms_solved),
+                "session_id": response.session_id,
+                "result_file": response.result_file,
+                "result_json": response.result_json,
+                "mean_reprojection_error_px": float(response.mean_reprojection_error_px),
+                "sample_counts": list(response.sample_counts),
+                "layout_updated": bool(response.layout_updated),
+                "layout_backup_file": response.layout_backup_file,
+                "message": response.message,
+            }
+        except Exception as error:
+            self.get_logger().error(f"Web calibration solve failed: {error}")
+            event = {
+                "type": "calibration_solve_result",
+                "request_id": request_id,
+                "success": False,
+                "all_arms_solved": False,
+                "session_id": "",
+                "result_file": "",
+                "result_json": "",
+                "mean_reprojection_error_px": 0.0,
+                "sample_counts": [],
+                "layout_updated": False,
+                "layout_backup_file": "",
+                "message": str(error),
+            }
+        self._server.send_event(event, client_id)
+
+    def _tf_frame_ids(self) -> set[str]:
+        """Return frame names currently known by the shared TF buffer."""
+
+        try:
+            document = yaml.safe_load(self._tf_buffer.all_frames_as_yaml()) or {}
+        except Exception as error:
+            self.get_logger().debug(f"TF frame graph is not ready: {error}")
+            return set()
+        if not isinstance(document, dict):
+            return set()
+        return {
+            str(frame).lstrip("/")
+            for frame in document
+            if isinstance(frame, str) and frame.strip("/")
+        }
+
+    def _tf_can_transform(self, target_frame: str, source_frame: str) -> bool:
+        try:
+            return bool(
+                self._tf_buffer.can_transform(
+                    target_frame,
+                    source_frame,
+                    Time(),
+                    timeout=Duration(seconds=0.0),
+                )
+            )
+        except Exception:
+            return False
+
+    def _frames_for_arm(self, arm: str) -> list[dict[str, Any]]:
+        base_frame = f"{arm}/base_link"
+        return [
+            {"type": 3, "name": frame_id, "frame_id": frame_id}
+            for frame_id in sorted(self._tf_frame_ids())
+            if frame_id == base_frame or self._tf_can_transform(base_frame, frame_id)
+        ]
+
+    def _publish_tf_frames(self) -> None:
+        for arm in ARMS:
+            frames = self._frames_for_arm(arm)
+            if frames == self._tf_frames_by_arm[arm]:
+                continue
+            self._tf_frames_by_arm[arm] = frames
+            self._server.send_event({"type": "tf_frames", "arm": arm, "frames": frames})
+
+    def _send_tf_frames(self, client_id: str) -> None:
+        for arm in ARMS:
+            self._server.send_event(
+                {"type": "tf_frames", "arm": arm, "frames": self._tf_frames_by_arm[arm]},
+                client_id,
+            )
+
+    def _tf_reference_frame(self, arm: str, reference_name: str, request_id: str) -> str:
+        frame_id = reference_name.lstrip("/")
+        if not frame_id or len(frame_id) > 128:
+            raise ProtocolError("coordinate_unavailable", "TF reference name is invalid", request_id)
+        base_frame = f"{arm}/base_link"
+        if not self._tf_can_transform(base_frame, frame_id):
+            raise ProtocolError(
+                "coordinate_unavailable",
+                f"TF frame {frame_id!r} is not connected to {base_frame!r}",
+                request_id,
+            )
+        return frame_id
+
+    def _resolve_reference(
+        self,
+        arm: str,
+        reference_type: int,
+        reference_name: str,
+        request_id: str,
+    ) -> tuple[int, str, str | None]:
+        """Resolve a web reference to driver fields and an optional TF frame."""
+
+        if reference_type == 3:
+            return 0, "base", self._tf_reference_frame(arm, reference_name, request_id)
+        goal = {"reference_type": reference_type, "reference_name": reference_name}
+        self._validate_reference(arm, goal, request_id)
+        return reference_type, reference_name, None
+
+    def _transform_pose(
+        self,
+        target_frame: str,
+        source_frame: str,
+        position: Any,
+        quaternion: Any,
+    ) -> tuple[list[float], list[float]]:
+        if target_frame == source_frame:
+            return list(position), list(quaternion)
+        transform = self._tf_buffer.lookup_transform(target_frame, source_frame, Time())
+        transformed_position, transformed_quaternion = transform_stamped_pose(
+            transform, position, quaternion
+        )
+        return list(transformed_position), list(transformed_quaternion)
+
+    @staticmethod
+    def _reference_event(reference_type: int, reference_name: str, frame_id: str | None) -> dict[str, Any]:
+        return {"type": reference_type, "name": reference_name, "frame_id": frame_id or ""}
+
+    def _get_current_pose(self, client_id: str, message: dict[str, Any]) -> None:
+        arm = message["arm"]
+        client = self._current_pose_clients[arm]
+        if not client.service_is_ready():
+            raise ProtocolError(
+                "kinematics_unavailable",
+                f"/{arm}/get_current_pose is not available",
+                message["request_id"],
+            )
+        selected = message.get("reference") or {}
+        default_type, default_name = self._default_reference(arm)
+        reference_type = int(selected.get("reference_type", default_type))
+        reference_name = str(selected.get("reference_name", default_name))
+        driver_type, driver_name, tf_frame = self._resolve_reference(
+            arm, reference_type, reference_name, message["request_id"]
+        )
+        request = GetCurrentPose.Request()
+        request.reference_type = driver_type
+        request.reference_name = driver_name
+        future = client.call_async(request)
+        future.add_done_callback(
+            lambda completed: self._current_pose_response(
+                client_id,
+                arm,
+                message["request_id"],
+                completed,
+                tf_frame,
+                self._reference_event(reference_type, reference_name, tf_frame),
+            )
+        )
+
+    def _solve_ik(self, client_id: str, message: dict[str, Any]) -> None:
+        arm = message["arm"]
+        goal = message["goal"]
+        client = self._ik_clients[arm]
+        if not client.service_is_ready():
+            raise ProtocolError(
+                "kinematics_unavailable",
+                f"/{arm}/solve_ik is not available",
+                message["request_id"],
+            )
+        reference_type = int(goal["reference_type"])
+        reference_name = str(goal["reference_name"])
+        driver_type, driver_name, tf_frame = self._resolve_reference(
+            arm, reference_type, reference_name, message["request_id"]
+        )
+        if reference_type == 3:
+            goal["pose_position_m"], goal["pose_quaternion_wxyz"] = self._transform_pose(
+                f"{arm}/base_link",
+                tf_frame or "",
+                goal["pose_position_m"],
+                goal["pose_quaternion_wxyz"],
+            )
+        goal["reference_type"] = driver_type
+        goal["reference_name"] = driver_name
+        request = assign_fields(SolveIk.Request(), goal)
+        future = client.call_async(request)
+        future.add_done_callback(
+            lambda completed: self._ik_response(
+                client_id, arm, message["request_id"], completed
+            )
+        )
+
+    def _current_pose_response(
+        self,
+        client_id: str,
+        arm: str,
+        request_id: str,
+        future: Any,
+        tf_frame: str | None,
+        reference: dict[str, Any],
+    ) -> None:
+        try:
+            response = future.result()
+            position = message_to_json(response.pose_position_m)
+            quaternion = message_to_json(response.pose_quaternion_wxyz)
+            if response.success and tf_frame:
+                position, quaternion = self._transform_pose(
+                    tf_frame,
+                    f"{arm}/base_link",
+                    position,
+                    quaternion,
+                )
+            event = {
+                "type": "kinematics_result",
+                "operation": "get_current_pose",
+                "arm": arm,
+                "request_id": request_id,
+                "success": bool(response.success),
+                "api2_status": int(response.api2_status),
+                "current_joint_degrees": message_to_json(response.current_joint_degrees),
+                "pose_position_m": position,
+                "pose_quaternion_wxyz": quaternion,
+                "reference": reference,
+                "message": response.message,
+            }
+        except Exception as error:
+            self.get_logger().error(f"Web current pose failed for {arm}: {error}")
+            event = {
+                "type": "kinematics_result",
+                "operation": "get_current_pose",
+                "arm": arm,
+                "request_id": request_id,
+                "success": False,
+                "api2_status": -1,
+                "current_joint_degrees": [],
+                "pose_position_m": [],
+                "pose_quaternion_wxyz": [],
+                "reference": reference,
+                "message": str(error),
+            }
+        self._server.send_event(event, client_id)
+
+    def _ik_response(self, client_id: str, arm: str, request_id: str, future: Any) -> None:
+        try:
+            response = future.result()
+            joints = [float(value) for value in response.joint_degrees]
+            if response.success and len(joints) != 6:
+                raise ValueError("IK service returned an invalid joint vector")
+            if response.success:
+                for joint, value in zip(self._robots[arm]["joints"], joints):
+                    if not joint["lower_deg"] <= value <= joint["upper_deg"]:
+                        raise ValueError(
+                            f"{joint['name']} IK result {value:.3f} deg is outside "
+                            f"[{joint['lower_deg']:.3f}, {joint['upper_deg']:.3f}]"
+                        )
+            event = {
+                "type": "kinematics_result",
+                "operation": "solve_ik",
+                "arm": arm,
+                "request_id": request_id,
+                "success": bool(response.success),
+                "api2_status": int(response.api2_status),
+                "joint_degrees": joints,
+                "message": response.message,
+            }
+        except Exception as error:
+            self.get_logger().error(f"Web inverse kinematics failed for {arm}: {error}")
+            event = {
+                "type": "kinematics_result",
+                "operation": "solve_ik",
+                "arm": arm,
+                "request_id": request_id,
+                "success": False,
+                "api2_status": -1,
+                "joint_degrees": [],
+                "message": str(error),
+            }
+        self._server.send_event(event, client_id)
+
+    def _list_joint_records(self, client_id: str, message: dict[str, Any]) -> None:
+        self._send_joint_records(client_id, message["arm"])
+
+    def _save_joint_record(self, client_id: str, message: dict[str, Any]) -> None:
+        arm = message["arm"]
+        joints = self._joint_degrees.get(arm)
+        if not joints:
+            raise ProtocolError(
+                "joint_state_unavailable",
+                f"{arm} has no current joint_states sample to record",
+                message["request_id"],
+            )
+        record = self._joint_records.save(arm, message["label"], joints)
+        event = {
+            "type": "joint_record_saved",
+            "arm": arm,
+            "request_id": message["request_id"],
+            "record": record.event(),
+        }
+        self._server.send_event(event, client_id)
+        self._send_joint_records(None, arm)
+
+    def _delete_joint_record(self, client_id: str, message: dict[str, Any]) -> None:
+        arm = message["arm"]
+        try:
+            record = self._joint_records.delete(arm, message["record_id"])
+        except ValueError as error:
+            raise ProtocolError(
+                "joint_record_unavailable",
+                str(error),
+                message["request_id"],
+            ) from error
+        self._server.send_event(
+            {
+                "type": "joint_record_deleted",
+                "arm": arm,
+                "request_id": message["request_id"],
+                "record": record.event(),
+            },
+            client_id,
+        )
+        self._send_joint_records(None, arm)
+
+    def _apply_joint_record(self, client_id: str, message: dict[str, Any]) -> None:
+        arm = message["arm"]
+        try:
+            record = self._joint_records.get(arm, message["record_id"])
+        except ValueError as error:
+            raise ProtocolError(
+                "joint_record_unavailable",
+                str(error),
+                message["request_id"],
+            ) from error
+        if message["command"] == 0:
+            self._server.send_event(
+                {
+                    "type": "joint_record_applied",
+                    "arm": arm,
+                    "request_id": message["request_id"],
+                    "command": message["command"],
+                    "record": record.event(),
+                    "joint_degrees": list(record.joint_degrees),
+                },
+                client_id,
+            )
+            return
+        client = self._fk_clients[arm]
+        if not client.service_is_ready():
+            raise ProtocolError(
+                "kinematics_unavailable",
+                f"/{arm}/forward_kinematics is not available",
+                message["request_id"],
+            )
+        selected = message.get("reference") or {}
+        default_type, default_name = self._default_reference(arm)
+        reference_type = int(selected.get("reference_type", default_type))
+        reference_name = str(selected.get("reference_name", default_name))
+        driver_type, driver_name, tf_frame = self._resolve_reference(
+            arm, reference_type, reference_name, message["request_id"]
+        )
+        request = ForwardKinematics.Request()
+        request.reference_type = driver_type
+        request.reference_name = driver_name
+        request.joint_degrees = list(record.joint_degrees)
+        future = client.call_async(request)
+        future.add_done_callback(
+            lambda completed: self._joint_record_fk_response(
+                client_id,
+                arm,
+                message["request_id"],
+                message["command"],
+                record.event(),
+                tf_frame,
+                self._reference_event(reference_type, reference_name, tf_frame),
+                completed,
+            )
+        )
+
+    def _joint_record_fk_response(
+        self,
+        client_id: str,
+        arm: str,
+        request_id: str,
+        command: int,
+        record: dict[str, Any],
+        tf_frame: str | None,
+        reference: dict[str, Any],
+        future: Any,
+    ) -> None:
+        try:
+            response = future.result()
+            position = message_to_json(response.pose_position_m)
+            quaternion = message_to_json(response.pose_quaternion_wxyz)
+            if response.success and tf_frame:
+                position, quaternion = self._transform_pose(
+                    tf_frame,
+                    f"{arm}/base_link",
+                    position,
+                    quaternion,
+                )
+            event = {
+                "type": "joint_record_applied",
+                "arm": arm,
+                "request_id": request_id,
+                "command": command,
+                "record": record,
+                "success": bool(response.success),
+                "api2_status": int(response.api2_status),
+                "joint_degrees": record["joint_degrees"],
+                "pose_position_m": position,
+                "pose_quaternion_wxyz": quaternion,
+                "reference": reference,
+                "message": response.message,
+            }
+        except Exception as error:
+            self.get_logger().error(f"Web joint record FK failed for {arm}: {error}")
+            event = {
+                "type": "joint_record_applied",
+                "arm": arm,
+                "request_id": request_id,
+                "command": command,
+                "record": record,
+                "success": False,
+                "api2_status": -1,
+                "joint_degrees": record["joint_degrees"],
+                "pose_position_m": [],
+                "pose_quaternion_wxyz": [],
+                "reference": reference,
+                "message": str(error),
+            }
+        self._server.send_event(event, client_id)
+
+    def _send_joint_records(self, client_id: str | None, arm: str) -> None:
+        self._server.send_event(
+            {
+                "type": "joint_records",
+                "arm": arm,
+                "records": [record.event() for record in self._joint_records.list(arm)],
+            },
+            client_id,
+        )
+
+    def _coordinate_state_message(self, arm: str, message: String) -> None:
+        try:
+            payload = json.loads(message.data)
+        except json.JSONDecodeError as error:
+            self.get_logger().warn(f"invalid coordinate state for {arm}: {error}")
+            return
+        if not isinstance(payload, dict):
+            return
+        self._coordinate_state[arm] = payload
+        self._server.send_event(payload)
+
+    def _cartesian_velocity_state_message(
+        self, arm: str, message: CartesianVelocityState
+    ) -> None:
+        state = {
+            "session_active": bool(message.session_active),
+            "reference_type": int(message.reference_type),
+            "reference_name": str(message.reference_name),
+            "command_frame_id": str(message.command_frame_id),
+            "commanded_linear_velocity_mps": [
+                float(value) for value in message.commanded_linear_velocity_mps
+            ],
+            "commanded_angular_velocity_radps": [
+                float(value) for value in message.commanded_angular_velocity_radps
+            ],
+            "limited_linear_velocity_mps": [
+                float(value) for value in message.limited_linear_velocity_mps
+            ],
+            "limited_angular_velocity_radps": [
+                float(value) for value in message.limited_angular_velocity_radps
+            ],
+            "measured_frame_id": str(message.measured_frame_id),
+            "measured_linear_velocity_mps": [
+                float(value) for value in message.measured_linear_velocity_mps
+            ],
+            "measured_angular_velocity_radps": [
+                float(value) for value in message.measured_angular_velocity_radps
+            ],
+            "measured_valid": bool(message.measured_valid),
+            "command_age_ms": int(message.command_age_ms),
+            "measured_age_ms": int(message.measured_age_ms),
+        }
+        self._cartesian_velocity_states[arm] = state
+        self._server.send_event(
+            {"type": "cartesian_velocity_state", "arm": arm, "state": state}
+        )
+
+    def _camera_health_message(self, message: String) -> None:
+        try:
+            payload = json.loads(message.data)
+        except json.JSONDecodeError as error:
+            self.get_logger().warn(f"invalid camera health state: {error}")
+            return
+        if payload.get("type") != "camera_health" or not isinstance(payload.get("inputs"), list):
+            self.get_logger().warn("ignoring invalid camera health state")
+            return
+        self._camera_health = payload
+        self._server.send_event(payload)
+
+    def _send_cached_state(self, client_id: str) -> None:
+        self._apply_input_mode_effects(self._input_modes.cached_events(client_id))
+        self._server.send_event(self._pika.state_event(), client_id)
+        self._server.send_event(self._camera_health, client_id)
+        self._server.send_event({"type": "gripper_list", "grippers": list(self._grippers.values())}, client_id)
+        for state in self._gripper_states.values():
+            self._server.send_event({"type": "gripper_state", **state}, client_id)
+        for arm in ARMS:
+            state = self._coordinate_state.get(arm)
+            if state is not None:
+                self._server.send_event(state, client_id)
+            velocity_state = self._cartesian_velocity_states.get(arm)
+            if velocity_state is not None:
+                self._server.send_event(
+                    {
+                        "type": "cartesian_velocity_state",
+                        "arm": arm,
+                        "state": velocity_state,
+                    },
+                    client_id,
+                )
+            self._send_joint_records(client_id, arm)
+        self._send_tf_frames(client_id)
+        with self._recording_lock:
+            recording = self._recording_view
+        if recording is not None:
+            self._server.send_event({"type": "recording_state", "recording": recording}, client_id)
+
+    def _default_reference(self, arm: str) -> tuple[int, str]:
+        state = self._coordinate_state.get(arm, {})
+        preferred = state.get("preferred_reference")
+        if isinstance(preferred, dict):
+            ref_type = preferred.get("type")
+            ref_name = preferred.get("name")
+            if isinstance(ref_type, int) and isinstance(ref_name, str) and ref_name:
+                return ref_type, ref_name
+        return 0, "base"
+
+    def _execute_motion(self, client_id: str, message: dict[str, Any]) -> None:
+        arm = message["arm"]
+        goal_values = message["goal"]
+        reference_type = int(goal_values["reference_type"])
+        reference_name = str(goal_values["reference_name"])
+        driver_type, driver_name, tf_frame = self._resolve_reference(
+            arm, reference_type, reference_name, message["request_id"]
+        )
+        if reference_type == 3 and goal_values["command"] != ExecuteMotion.Goal.MOVEJ:
+            goal_values["pose_position_m"], goal_values["pose_quaternion_wxyz"] = self._transform_pose(
+                f"{arm}/base_link",
+                tf_frame or "",
+                goal_values["pose_position_m"],
+                goal_values["pose_quaternion_wxyz"],
+            )
+        goal_values["reference_type"] = driver_type
+        goal_values["reference_name"] = driver_name
+        if goal_values["command"] == ExecuteMotion.Goal.MOVEJ:
+            for joint, value in zip(self._robots[arm]["joints"], goal_values["joint_degrees"]):
+                if not joint["lower_deg"] <= value <= joint["upper_deg"]:
+                    raise ProtocolError(
+                        "joint_limit",
+                        f"{joint['name']} target {value:.3f} deg is outside "
+                        f"[{joint['lower_deg']:.3f}, {joint['upper_deg']:.3f}]",
+                        message["request_id"],
+                    )
+        quaternion = goal_values["pose_quaternion_wxyz"]
+        if goal_values["command"] != ExecuteMotion.Goal.MOVEJ and math.sqrt(
+            sum(value * value for value in quaternion)
+        ) < 1.0e-9:
+            raise ProtocolError("invalid_field", "pose quaternion magnitude must be non-zero")
+        client = self._motion_clients[arm]
+        if not client.server_is_ready():
+            raise ProtocolError(
+                "action_unavailable",
+                f"/{arm}/execute_motion is not available",
+                message["request_id"],
+            )
+        record = self._reserve_action(
+            arm,
+            "execute_motion",
+            client_id,
+            message["request_id"],
+        )
+        goal = assign_fields(ExecuteMotion.Goal(), goal_values)
+        self._send_goal(client, goal, record)
+
+    def _execute_trajectory(
+        self, client_id: str, message: dict[str, Any]
+    ) -> None:
+        arm = message["arm"]
+        goal_values = message["goal"]
+        reference_type = int(goal_values["reference_type"])
+        reference_name = str(goal_values["reference_name"])
+        driver_type, driver_name, tf_frame = self._resolve_reference(
+            arm, reference_type, reference_name, message["request_id"]
+        )
+        if reference_type == 3:
+            for waypoint in goal_values["waypoints"]:
+                if waypoint["command"] != MotionWaypoint.MOVEJ:
+                    waypoint["pose_position_m"], waypoint["pose_quaternion_wxyz"] = self._transform_pose(
+                        f"{arm}/base_link",
+                        tf_frame or "",
+                        waypoint["pose_position_m"],
+                        waypoint["pose_quaternion_wxyz"],
+                    )
+        goal_values["reference_type"] = driver_type
+        goal_values["reference_name"] = driver_name
+        for index, waypoint in enumerate(goal_values["waypoints"]):
+            if waypoint["command"] == MotionWaypoint.MOVEJ:
+                for joint, value in zip(
+                    self._robots[arm]["joints"],
+                    waypoint["joint_degrees"],
+                ):
+                    if not joint["lower_deg"] <= value <= joint["upper_deg"]:
+                        raise ProtocolError(
+                            "joint_limit",
+                            f"waypoint[{index}] {joint['name']} target "
+                            f"{value:.3f} deg is outside "
+                            f"[{joint['lower_deg']:.3f}, "
+                            f"{joint['upper_deg']:.3f}]",
+                            message["request_id"],
+                        )
+            elif math.sqrt(
+                sum(value * value for value in waypoint["pose_quaternion_wxyz"])
+            ) < 1.0e-9:
+                raise ProtocolError(
+                    "invalid_field",
+                    f"waypoint[{index}] pose quaternion magnitude must be non-zero",
+                    message["request_id"],
+                )
+        client = self._trajectory_clients[arm]
+        if not client.server_is_ready():
+            raise ProtocolError(
+                "action_unavailable",
+                f"/{arm}/execute_trajectory is not available",
+                message["request_id"],
+            )
+        record = self._reserve_action(
+            arm,
+            "execute_trajectory",
+            client_id,
+            message["request_id"],
+        )
+        goal = ExecuteTrajectory.Goal()
+        goal.reference_type = goal_values["reference_type"]
+        goal.reference_name = goal_values["reference_name"]
+        goal.timeout_sec = goal_values["timeout_sec"]
+        goal.waypoints = [
+            assign_fields(MotionWaypoint(), waypoint)
+            for waypoint in goal_values["waypoints"]
+        ]
+        self._send_goal(client, goal, record)
+
+    def _start_velocity(self, client_id: str, message: dict[str, Any]) -> None:
+        arm = message["arm"]
+        goal_values = message["goal"]
+        reference_type, reference_name = self._default_reference(arm)
+        goal_values["reference_type"] = reference_type
+        goal_values["reference_name"] = reference_name
+        frame = self._validate_reference(arm, goal_values, message["request_id"])
+        settings = self._robots[arm]["motion"]
+        exact_fields = (
+            "velocity_control_period_ms",
+            "velocity_watchdog_ms",
+        )
+        goal_fields = ("control_period_ms", "watchdog_ms")
+        for expected_key, goal_key in zip(exact_fields, goal_fields):
+            if int(goal_values[goal_key]) != int(settings[expected_key]):
+                raise ProtocolError(
+                    "safety_limit",
+                    f"goal.{goal_key} must equal configured {int(settings[expected_key])}",
+                    message["request_id"],
+                )
+        goal_values["max_linear_speed_mps"] = settings["max_linear_speed_mps"]
+        goal_values["max_angular_speed_radps"] = settings["max_angular_speed_radps"]
+        for goal_key, setting_key in (
+            ("max_linear_speed_mps", "max_linear_speed_mps"),
+            ("max_angular_speed_radps", "max_angular_speed_radps"),
+            ("max_linear_accel_mps2", "max_linear_accel_mps2"),
+            ("max_angular_accel_radps2", "max_angular_accel_radps2"),
+        ):
+            if goal_values[goal_key] > settings[setting_key]:
+                raise ProtocolError(
+                    "safety_limit",
+                    f"goal.{goal_key} exceeds configured {settings[setting_key]}",
+                    message["request_id"],
+                )
+        radio_limit = {0: 0, 1: 100, 2: 1000}[goal_values["trajectory_mode"]]
+        if goal_values["radio"] > radio_limit:
+            raise ProtocolError(
+                "invalid_field",
+                f"goal.radio exceeds {radio_limit} for trajectory_mode",
+                message["request_id"],
+            )
+        client = self._velocity_clients[arm]
+        if not client.server_is_ready():
+            raise ProtocolError(
+                "action_unavailable",
+                f"/{arm}/cartesian_velocity is not available",
+                message["request_id"],
+            )
+        record = self._reserve_action(
+            arm,
+            "cartesian_velocity",
+            client_id,
+            message["request_id"],
+            frame_id=frame["frame_id"],
+        )
+        goal = assign_fields(CartesianVelocity.Goal(), goal_values)
+        self._send_goal(client, goal, record)
+
+    def _validate_reference(
+        self, arm: str, goal: dict[str, Any], request_id: str = ""
+    ) -> dict[str, Any]:
+        candidates = [
+            value
+            for value in self._robots[arm]["frames"].values()
+            if value["type"] == goal["reference_type"]
+        ]
+        # Pika modes switch the controller to another configured work frame
+        # (e.g. pikabase); the driver checks against that live frame, so a
+        # verified live work/tool frame is as valid as the manifest default.
+        state = self._coordinate_state.get(arm, {})
+        for key in ("work", "tool"):
+            live = state.get(key)
+            if (isinstance(live, dict) and live.get("type") == goal["reference_type"]
+                    and state.get(f"{key}_matched") is True
+                    and isinstance(live.get("name"), str) and isinstance(live.get("frame_id"), str)):
+                candidates.append({"type": live["type"], "name": live["name"], "frame_id": live["frame_id"]})
+        frame = next(
+            (value for value in candidates if value["name"] == goal["reference_name"]),
+            None,
+        )
+        if frame is None:
+            raise ProtocolError(
+                "coordinate_mismatch",
+                "reference type/name must match the configured active frame",
+                request_id,
+            )
+        return frame
+
+    def _reserve_action(
+        self,
+        arm: str,
+        action: str,
+        owner: str,
+        request_id: str,
+        *,
+        frame_id: str = "",
+    ) -> ActionRecord:
+        key = (arm, action)
+        if key in self._actions or any(existing.arm == arm for existing in self._actions.values()):
+            raise ProtocolError("action_busy", f"{arm} already has an active Web goal", request_id)
+        record = ActionRecord(arm, action, owner, request_id, frame_id=frame_id)
+        self._actions[key] = record
+        self._server.send_event(action_event(record, "submitting"))
+        return record
+
+    def _send_goal(self, client: Any, goal: Any, record: ActionRecord) -> None:
+        future = client.send_goal_async(
+            goal,
+            feedback_callback=lambda message: self._action_feedback(record, message),
+        )
+        future.add_done_callback(lambda completed: self._goal_response(record, completed))
+
+    @_serialized_control
+    def _goal_response(self, record: ActionRecord, future: Any) -> None:
+        key = (record.arm, record.action)
+        if self._actions.get(key) is not record:
+            return
+        try:
+            goal_handle = future.result()
+        except Exception as error:
+            self._actions.pop(key, None)
+            self.get_logger().error(
+                f"Web goal submission failed for {record.arm}/{record.action}: {error}"
+            )
+            self._server.send_event(action_event(record, "error", message=str(error)))
+            return
+        if not goal_handle.accepted:
+            self._actions.pop(key, None)
+            self._server.send_event(action_event(record, "rejected"))
+            return
+        record.goal_handle = goal_handle
+        self._server.send_event(action_event(record, "accepted"))
+        if record.cancel_requested:
+            try:
+                self._request_cancel(record)
+            except Exception as error:
+                self.get_logger().error(f"Web delayed goal cancel failed: {error}")
+                self._server.send_event(action_event(record, "error", message=str(error)))
+        try:
+            result_future = goal_handle.get_result_async()
+            result_future.add_done_callback(lambda completed: self._action_result(record, completed))
+        except Exception as error:
+            record.result_unavailable = True
+            self._release_unobserved_cancel(record)
+            self.get_logger().error(f"Web result listener failed for {record.arm}/{record.action}: {error}")
+            self._server.send_event(self._result_transport_event(record, error))
+
+    def _action_feedback(self, record: ActionRecord, feedback_message: Any) -> None:
+        if self._actions.get((record.arm, record.action)) is not record:
+            return
+        self._server.send_event(
+            {
+                "type": "action_feedback",
+                "arm": record.arm,
+                "action": record.action,
+                "request_id": record.request_id,
+                "feedback": message_to_json(feedback_message.feedback),
+            }
+        )
+
+    def _result_transport_event(self, record: ActionRecord, error: Exception) -> dict[str, Any]:
+        if "goal handle is not known to this client" in str(error).lower():
+            # A physical emergency stop can tear down the action server's
+            # goal state before rclpy delivers the result.  The raw
+            # transport exception is useful in logs but is not a browser
+            # diagnosis, and this goal can no longer be cancelled.
+            self._actions.pop((record.arm, record.action), None)
+            return action_event(
+                record,
+                "stopped",
+                code="goal_handle_unknown",
+                message="运动已中断，Action 结果不可用；请检查急停状态并恢复机械臂",
+            )
+        return action_event(record, "error", message=str(error))
+
+    @_serialized_control
+    def _action_result(self, record: ActionRecord, future: Any) -> None:
+        key = (record.arm, record.action)
+        if self._actions.get(key) is not record:
+            return
+        try:
+            wrapped = future.result()
+            self._actions.pop(key, None)
+            event = {
+                "type": "action_result",
+                "arm": record.arm,
+                "action": record.action,
+                "request_id": record.request_id,
+                "status": int(wrapped.status),
+                "result": message_to_json(wrapped.result),
+            }
+        except Exception as error:
+            record.result_unavailable = True
+            self._release_unobserved_cancel(record)
+            self.get_logger().error(
+                f"Web action result failed for {record.arm}/{record.action}: {error}"
+            )
+            event = self._result_transport_event(record, error)
+        self._server.send_event(event)
+
+    def _cancel_action(self, client_id: str, arm: str, action: str) -> None:
+        record = self._actions.get((arm, action))
+        try:
+            effects = self._input_modes.cancel_motion(arm, action=action, client_id=client_id)
+        except ProtocolError:
+            if record is None or record.owner != client_id:
+                raise
+            effects = []  # Another browser's queue cannot block cancellation of our Action.
+        self._apply_input_mode_effects(effects)
+        if record is None:
+            if effects:
+                return
+            raise ProtocolError("no_active_goal", f"{arm} {action} has no active Web goal")
+        if record.owner != client_id:
+            if effects:
+                return
+            raise ProtocolError("not_goal_owner", "only the client that started this goal may cancel it")
+        record.cancel_requested = True
+        self._server.send_event(action_event(record, "canceling"))
+        if record.goal_handle is not None:
+            self._request_cancel(record)
+
+    def _release_unobserved_cancel(self, record: ActionRecord) -> None:
+        if record.result_unavailable and record.cancel_submitted:
+            key = (record.arm, record.action)
+            if self._actions.get(key) is record:
+                self._actions.pop(key)
+
+    def _retry_web_cancellations(self) -> None:
+        for record in list(self._actions.values()):
+            if record.cancel_requested and not record.cancel_submitted and record.goal_handle is not None:
+                try:
+                    self._request_cancel(record)
+                except Exception as error:
+                    self.get_logger().error(
+                        f"Web cancellation retry failed for {record.arm}/{record.action}: {error}",
+                        throttle_duration_sec=self._mode_discovery_period,
+                    )
+
+    @_serialized_control
+    def _request_cancel(self, record: ActionRecord) -> None:
+        if (self._actions.get((record.arm, record.action)) is not record
+                or record.goal_handle is None or record.cancel_submitted):
+            return
+        # Set before entering transport to prevent concurrent/reentrant sends.
+        # Submission exceptions restore retry ownership; a returned future is a
+        # successful submission even if acknowledgement/listener setup fails.
+        record.cancel_submitted = True
+        try:
+            future = record.goal_handle.cancel_goal_async()
+        except Exception:
+            record.cancel_submitted = False
+            raise
+        self._release_unobserved_cancel(record)
+        future.add_done_callback(lambda completed: self._cancel_response(record, completed))
+
+    def _cancel_response(self, record: ActionRecord, future: Any) -> None:
+        try:
+            response = future.result()
+            accepted = bool(response.goals_canceling)
+            self._server.send_event(
+                action_event(record, "cancel_requested" if accepted else "cancel_rejected")
+            )
+        except Exception as error:
+            self.get_logger().error(
+                f"Web cancel failed for {record.arm}/{record.action}: {error}"
+            )
+            self._server.send_event(action_event(record, "error", message=str(error)))
+
+    def _velocity_command(self, client_id: str, message: dict[str, Any]) -> None:
+        arm = message["arm"]
+        record = self._actions.get((arm, "cartesian_velocity"))
+        if record is None or record.owner != client_id or record.goal_handle is None:
+            raise ProtocolError(
+                "velocity_not_owned",
+                "start and own an accepted Cartesian velocity action before streaming commands",
+            )
+        settings = self._robots[arm]["motion"]
+        if any(abs(value) > settings["max_linear_speed_mps"] for value in message["linear"]):
+            raise ProtocolError("safety_limit", "linear velocity exceeds configured component limit")
+        if any(abs(value) > settings["max_angular_speed_radps"] for value in message["angular"]):
+            raise ProtocolError("safety_limit", "angular velocity exceeds configured component limit")
+        self._publish_velocity(arm, record.frame_id, message["linear"], message["angular"])
+
+    def _publish_velocity(
+        self,
+        arm: str,
+        frame_id: str,
+        linear: list[float] | tuple[float, float, float],
+        angular: list[float] | tuple[float, float, float],
+    ) -> None:
+        command = TwistStamped()
+        command.header.stamp = self.get_clock().now().to_msg()
+        command.header.frame_id = frame_id
+        command.twist.linear.x, command.twist.linear.y, command.twist.linear.z = linear
+        command.twist.angular.x, command.twist.angular.y, command.twist.angular.z = angular
+        self._velocity_publishers[arm].publish(command)
+
+    def _software_stop(self, client_id: str, message: dict[str, Any]) -> None:
+        arm = message["arm"]
+        self._apply_input_mode_effects(self._input_modes.cancel_motion(arm))
+        client = self._stop_clients[arm]
+        if not client.service_is_ready():
+            raise ProtocolError("stop_unavailable", f"/{arm}/stop is not available", message["request_id"])
+        future = client.call_async(Trigger.Request())
+        future.add_done_callback(
+            lambda completed: self._software_stop_response(client_id, arm, message["request_id"], completed)
+        )
+        self._server.send_event(
+            {
+                "type": "software_stop_state",
+                "arm": arm,
+                "request_id": message["request_id"],
+                "state": "requested",
+            }
+        )
+
+    def _software_stop_response(
+        self,
+        client_id: str,
+        arm: str,
+        request_id: str,
+        future: Any,
+    ) -> None:
+        try:
+            response = future.result()
+            event = {
+                "type": "software_stop_result",
+                "arm": arm,
+                "request_id": request_id,
+                "success": bool(response.success),
+                "message": response.message,
+            }
+        except Exception as error:
+            self.get_logger().error(f"Web software stop failed for {arm}: {error}")
+            event = {
+                "type": "software_stop_result",
+                "arm": arm,
+                "request_id": request_id,
+                "success": False,
+                "message": str(error),
+            }
+        self._server.send_event(event, client_id)
+
+    def _stop_behavior_tree(self, client_id: str, message: dict[str, Any]) -> None:
+        request_id = message["request_id"]
+        if not self._bt_shutdown_client.service_is_ready():
+            raise ProtocolError(
+                "behavior_tree_unavailable",
+                "/realman_bt_executor/shutdown is not available; no behavior tree is running",
+                request_id,
+            )
+        self.get_logger().warning(f"Web client {client_id} requested behavior-tree shutdown")
+
+        def done(completed: Any) -> None:
+            try:
+                response = completed.result()
+                event = {"type": "behavior_tree_stop_result", "request_id": request_id,
+                         "success": bool(response.success), "message": response.message}
+            except Exception as error:
+                self.get_logger().error(f"Web behavior-tree shutdown failed: {error}")
+                event = {"type": "behavior_tree_stop_result", "request_id": request_id,
+                         "success": False, "message": str(error)}
+            self._server.send_event(event, client_id)
+
+        self._bt_shutdown_client.call_async(Trigger.Request()).add_done_callback(done)
+
+    def _recording_status_message(self, message: RecordingStatus) -> None:
+        view = recording_view(
+            state=int(message.state),
+            session_id=message.session_id,
+            elapsed_sec=message.elapsed_sec,
+            diagnostics_json=message.diagnostics_json,
+        )
+        # Broadcast under the lock: send_event only schedules onto the server loop (FIFO), so
+        # concurrent status callbacks reach clients in the order they updated the view.
+        with self._recording_lock:
+            changed = view_changed(self._recording_view, view)
+            self._recording_view = view
+            if changed:
+                self._server.send_event({"type": "recording_state", "recording": view}, None)
+
+    def _quality_mark(self, client_id: str, message: dict[str, Any]) -> None:
+        reason = message["reason"]
+        if reason and reason not in self._quality_reason_ids:
+            raise ProtocolError("invalid_reason", f"unknown deviation reason: {reason}", message["request_id"])
+        mark = QualityMark()
+        mark.kind = MARK_KINDS[message["kind"]]
+        mark.stamp = self._wall_clock.now().to_msg()
+        mark.reason = reason
+        self._quality_mark_publisher.publish(mark)
+        self._server.send_event(
+            {"type": "quality_mark_result", "request_id": message["request_id"],
+             "kind": message["kind"], "reason": reason},
+            client_id,
+        )
+
+    def _recover_motion(self, client_id: str, message: dict[str, Any]) -> None:
+        arm = message["arm"]
+        client = self._recovery_clients[arm]
+        if not client.service_is_ready():
+            raise ProtocolError(
+                "recovery_unavailable",
+                f"/{arm}/recover_motion is not available",
+                message["request_id"],
+            )
+        future = client.call_async(RecoverMotion.Request())
+        future.add_done_callback(
+            lambda completed: self._recover_motion_response(
+                client_id,
+                arm,
+                message["request_id"],
+                completed,
+            )
+        )
+        self._server.send_event(
+            {
+                "type": "motion_recovery_state",
+                "arm": arm,
+                "request_id": message["request_id"],
+                "state": "requested",
+            }
+        )
+
+    def _recover_motion_response(
+        self,
+        client_id: str,
+        arm: str,
+        request_id: str,
+        future: Any,
+    ) -> None:
+        try:
+            response = future.result()
+            event = {
+                "type": "motion_recovery_result",
+                "arm": arm,
+                "request_id": request_id,
+                "success": bool(response.success),
+                "recovered": bool(response.recovered),
+                "api2_status": int(response.api2_status),
+                "message": response.message,
+            }
+        except Exception as error:
+            self.get_logger().error(f"Web motion recovery failed for {arm}: {error}")
+            event = {
+                "type": "motion_recovery_result",
+                "arm": arm,
+                "request_id": request_id,
+                "success": False,
+                "recovered": False,
+                "api2_status": -1,
+                "message": str(error),
+            }
+        self._server.send_event(event, client_id)
+
+    def _client_disconnected(self, client_id: str) -> None:
+        self._apply_input_mode_effects(self._input_modes.client_disconnected(client_id))
+        for record in list(self._actions.values()):
+            if record.owner != client_id:
+                continue
+            if record.action == "cartesian_velocity":
+                self._publish_velocity(record.arm, record.frame_id, [0.0] * 3, [0.0] * 3)
+            record.cancel_requested = True
+            if record.goal_handle is not None:
+                self._request_cancel(record)
+            self.get_logger().warn(
+                f"Web client disconnected; cancel requested for {record.arm}/{record.action}"
+            )
+
+    def _joint_state(self, arm: str, message: JointState) -> None:
+        self._link_state.rates.record(f"joint_states/{arm}")
+        positions = dict(zip(message.name, message.position))
+        names = [f"joint_{index}" for index in range(1, 7)]
+        if not all(name in positions for name in names):
+            return
+        stamp = message.header.stamp
+        stamp_ns = int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+        values = [float(positions[name]) for name in names]
+        if stamp_ns <= 0 or not all(math.isfinite(value) for value in values):
+            return
+        if stamp_ns <= self._last_joint_stamp_ns.get(arm, 0):
+            return
+        # Keep a duplicate/default joint_state publisher from resetting the
+        # browser model while the real driver continues reporting its pose.
+        if arm in self._has_nonzero_joint_state and all(value == 0.0 for value in values):
+            return
+        self._last_joint_stamp_ns[arm] = stamp_ns
+        if any(value != 0.0 for value in values):
+            self._has_nonzero_joint_state.add(arm)
+        self._joint_degrees[arm] = [math.degrees(value) for value in values]
+        self._server.send_event(
+            {
+                "type": "joint_state",
+                "arm": arm,
+                "names": names,
+                "positions_rad": values,
+                "stamp_ns": stamp_ns,
+            }
+        )
+
+    def _joint_current_message(self, arm: str, message: JointState) -> None:
+        # The driver's /<arm>/joint_currents: mA in effort, stamped like the matching joint_states.
+        currents = [float(value) for value in message.effort[:6]]
+        if len(currents) != 6 or not all(math.isfinite(value) for value in currents):
+            return
+        stamp = message.header.stamp
+        self._server.send_event(
+            {
+                "type": "joint_currents",
+                "arm": arm,
+                "currents_ma": currents,
+                "stamp_ns": int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec),
+            }
+        )
+
+    def _connection(self, arm: str, message: Bool) -> None:
+        self._server.send_event(
+            {"type": "connection", "arm": arm, "connected": bool(message.data)}
+        )
+
+    def destroy_node(self) -> bool:
+        self._publish_keyboard_zeros()
+        self._keyboard.deactivate()
+        self._server.stop()
+        return super().destroy_node()
+
+
+def main(args: list[str] | None = None) -> None:
+    rclpy.init(args=args)
+    node: WebControlNode | None = None
+    executor = MultiThreadedExecutor(num_threads=4)
+    try:
+        node = WebControlNode()
+        executor.add_node(node)
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        executor.shutdown()
+        if node is not None:
+            node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
